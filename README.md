@@ -42,6 +42,13 @@ python3 brokerctl.py recv --role builder --wait 60
 python3 brokerctl.py send --to architect --from-role builder --body "TASK-001 ready for review PR #123"
 ```
 
+## Commit Identity Hygiene
+
+When this protocol is used inside `netauto-labs`, commits should resolve to the
+approved GitHub-linked personal address for the org rather than a corporate work
+address. Check `git config user.email` before committing, and prefer an org-specific
+Git include so the safe identity is applied automatically by remote URL.
+
 ## How It Works
 
 ```

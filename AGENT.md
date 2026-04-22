@@ -38,6 +38,12 @@ python3 brokerctl.py recv --role YOUR_ROLE --since 2026-04-22T12:00:00+00:00
 python3 brokerctl.py status
 ```
 
+## Commit identity
+
+Before any commit or push in a `netauto-labs` repo, confirm `git config user.email`
+resolves to the approved GitHub-linked personal address for the org.
+Do not use a corporate work address for commits in this org.
+
 ## Rules
 
 1. Send a message after every meaningful action (task claimed, PR opened, review done, task merged)
