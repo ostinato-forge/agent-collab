@@ -25,11 +25,11 @@ python3 scripts/collab.py init
 
 This creates `.collab/` with task files, inboxes, and state tracking. Add `.collab/` to your `.gitignore` — it's ephemeral session state, not production code.
 
-Start the optional real-time broker in a second terminal:
+Start the secure real-time broker in a second terminal:
 
 ```bash
 cd /path/to/agent-collab
-python3 broker.py --port 9111
+python3 brokerctl.py up
 ```
 
 Agents can now use the filesystem for durable coordination and `http://127.0.0.1:9111` for instant notifications.
@@ -37,10 +37,16 @@ Agents can now use the filesystem for durable coordination and `http://127.0.0.1
 Prefer the local wrapper instead of raw `curl` when driving agents from a restricted runtime:
 
 ```bash
+python3 brokerctl.py onboard --role builder
 python3 brokerctl.py status
 python3 brokerctl.py recv --role builder --wait 60
 python3 brokerctl.py send --to architect --from-role builder --body "TASK-001 ready for review PR #123"
+python3 brokerctl.py chat --role builder --peer architect
 ```
+
+`brokerctl.py up` enables token auth by default and writes the token to a per-user
+token file under `/tmp` so other local agents can connect without re-copying secrets
+by hand.
 
 ## Commit Identity Hygiene
 
@@ -99,22 +105,34 @@ python3 scripts/collab.py watch --role builder \         # background watcher + 
 Use the broker alongside `scripts/collab.py` when you want low-latency coordination instead of polling files manually.
 
 ```bash
-python3 broker.py --port 9111                                      # start broker
+python3 brokerctl.py onboard --role builder                  # one-screen agent quickstart
+python3 brokerctl.py up                                            # start secure broker
 python3 brokerctl.py status                                        # queue depth / role summary
 python3 brokerctl.py recv --role builder                           # check messages
 python3 brokerctl.py recv --role builder --wait 60                 # block until a message arrives
-python3 brokerctl.py recv --role builder --since 2026-04-22T12:00:00+00:00
+python3 brokerctl.py recv --role builder --after-id 12 --wait 60
+python3 brokerctl.py history --channel dm:architect:builder --kind chat --limit 20
 python3 brokerctl.py send --to architect --from-role builder \
   --body "TASK-001 ready for review PR #123"
+python3 brokerctl.py chat --role builder --peer architect          # live terminal chat
 ```
 
-The broker is safe for concurrent long-poll listeners: an idle `recv --wait 60` no longer blocks `send` or `status` requests from other agents.
+The broker is safe for concurrent long-poll listeners: an idle `recv --wait 60` no longer blocks `send`, `history`, or `status` requests from other agents.
+
+Security defaults:
+- token auth is on by default
+- brokerctl auto-loads the token from the shared token file or `AGENT_COLLAB_TOKEN`
+- only bind off-loopback or disable auth if you are intentionally trading safety for convenience
+- broker message bodies reject control characters, and the CLI escapes any old/stale control bytes before printing
+- `chat` is coordination-only; task files remain the source of truth
 
 Recommended split:
 - use `.collab/tasks/`, `.collab/reviews/`, and `scripts/collab.py` for lifecycle truth
 - use the broker for immediate signals like "task claimed", "PR ready", "merged", and "resume listening"
+- use broker chat for short clarifications, unblockers, and live coordination
 - use `/status` to confirm the broker is alive after restarts or fixes
-- use `recv?since=...` when reconnecting after an interruption so you do not replay stale messages
+- use `after_id` when reconnecting after an interruption so you do not replay stale messages
+- promote any important chat decision back into `.collab` via `handoff`, `review`, `complete`, or `message`
 
 ## Coordination Files
 
@@ -163,12 +181,16 @@ Use both layers together:
 
 1. `watch` for passive notification.
 2. `sync` for explicit checkpoints and freshness tracking.
-3. broker `recv?wait=...` for instant handoffs when an agent is otherwise idle
+3. broker `recv --wait ...` for instant handoffs when an agent is otherwise idle
+4. broker `chat` when two agents need a short live conversation without waiting on inbox polling
 
 Recommended pattern for each agent:
 
+- run `python3 brokerctl.py onboard --role <role>` once at session start or paste its output into the other agent
 - run `python3 scripts/collab.py watch --role <role> --actor <role> --interval 60` in the background
+- run `python3 brokerctl.py up` once per machine/session in a dedicated terminal
 - run `python3 brokerctl.py recv --role <role> --wait 60` when you are idle and waiting for the next handoff
+- run `python3 brokerctl.py chat --role <role> --peer <other-role>` when you need live back-and-forth
 - run `python3 scripts/collab.py sync --role <role> --actor <role> ...` at:
   - session start
   - before editing files
@@ -180,6 +202,8 @@ Recommended pattern for each agent:
 - what changed in your queue since your last checkpoint
 - whether your inbox changed since your last checkpoint
 - whether the peer role looks stale
+
+State-changing `collab.py` commands also auto-record sync metadata now, so silence is less likely to look like a stall.
 
 ## Agent Runtime Notes
 

@@ -130,3 +130,72 @@ def test_command_status_shows_role_sync_metadata(tmp_path, capsys) -> None:
     assert "last_sync_by=builder" in output
     assert "last_sync_task_id=TASK-007" in output
     assert "last_sync_branch=feat/remediation-rollout-models" in output
+
+
+def test_state_changing_commands_auto_sync_actor_role(tmp_path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    collab.command_init(root)
+    collab.command_new_task(
+        root,
+        title="Queued task",
+        created_by="architect",
+        assigned_role="builder",
+        source_plan=None,
+        branch="feat/queued-task",
+        files=[],
+        acceptance=[],
+        note=None,
+    )
+
+    state = collab.read_json(collab.state_path(root))
+    architect_state = state["roles"]["architect"]
+    assert architect_state["last_sync_by"] == "architect"
+    assert architect_state["last_sync_task_id"] == "TASK-001"
+    assert architect_state["last_sync_branch"] == "feat/queued-task"
+    assert architect_state["last_sync_note"] == "auto: created TASK-001"
+
+    collab.command_claim(root, task_id="TASK-001", actor="builder")
+    state = collab.read_json(collab.state_path(root))
+    builder_state = state["roles"]["builder"]
+    assert builder_state["last_sync_by"] == "builder"
+    assert builder_state["last_sync_task_id"] == "TASK-001"
+    assert builder_state["last_sync_branch"] == "feat/queued-task"
+    assert builder_state["last_sync_note"] == "auto: claimed TASK-001"
+
+
+def test_command_next_includes_handoff_context(tmp_path, capsys) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    collab.command_init(root)
+    collab.command_new_task(
+        root,
+        title="Queued task",
+        created_by="architect",
+        assigned_role="builder",
+        source_plan="docs/plan.md",
+        branch="feat/queued-task",
+        files=["src/example.py"],
+        acceptance=["tests pass"],
+        note="Start here",
+    )
+    collab.command_claim(root, task_id="TASK-001", actor="builder")
+    collab.command_handoff(
+        root,
+        task_id="TASK-001",
+        actor="builder",
+        to_role="architect",
+        summary="Ready for review",
+        branch="feat/queued-task",
+        pr_url="https://github.com/example/repo/pull/1",
+        commit="abc1234",
+    )
+
+    collab.command_next(root, "architect")
+    output = capsys.readouterr().out
+
+    assert "handoff_pr_url: https://github.com/example/repo/pull/1" in output
+    assert "handoff_summary: Ready for review" in output
+    assert "handoff_commit: abc1234" in output

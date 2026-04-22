@@ -10,6 +10,33 @@ This protocol assumes:
 
 The user stays out of band and steps in only when needed.
 
+## Secure Broker Layer
+
+Use the broker as a real-time sidecar, not as the source of truth:
+
+- `.collab/tasks/*.json` remains authoritative
+- broker messages wake the peer up quickly
+- broker chat is for short live coordination only
+- important outcomes get promoted back into `.collab`
+
+Simple onboarding:
+
+```bash
+python3 brokerctl.py up
+python3 brokerctl.py onboard --role builder
+python3 brokerctl.py recv --role builder --wait 60
+python3 brokerctl.py chat --role builder --peer architect
+```
+
+Security defaults:
+
+- token auth is enabled by default
+- `brokerctl.py` auto-loads the token from the shared token file
+- `--insecure-no-auth` exists only for throwaway local testing
+- broker message bodies are single-line only and reject control characters
+- the CLI escapes control bytes before printing old/stale messages to the terminal
+- use `after_id` or explicit filters when resuming after an interruption
+
 ## Canonical Files
 
 - `.collab/state.json`
@@ -66,6 +93,8 @@ Recommended checkpoint moments:
 - the peer role's last sync freshness
 
 `watch --actor ...` keeps a lightweight heartbeat warm in the background while still printing queue changes.
+
+State-changing `collab.py` commands also auto-record sync metadata now, so `new-task`, `claim`, `handoff`, `review`, `complete`, and `message` update the role checkpoint even if the agent forgets to run a separate `sync`.
 
 ## Workflow
 

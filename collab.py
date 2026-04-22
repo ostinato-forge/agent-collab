@@ -23,7 +23,7 @@ TASK_STATUSES = (
     "done",
 )
 REVIEW_DECISIONS = ("approve", "changes_requested", "blocked")
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 def utc_now() -> str:
@@ -70,6 +70,10 @@ def default_role_state() -> dict[str, Any]:
         "last_sync_note": None,
         "last_inbox_mtime": 0.0,
     }
+
+
+def actor_role(actor: str) -> str | None:
+    return actor if actor in ROLES else None
 
 
 def default_state(project_name: str) -> dict[str, Any]:
@@ -249,6 +253,60 @@ def queued_tasks(tasks: list[dict[str, Any]], role: str) -> list[dict[str, Any]]
     )
 
 
+def tasks_by_id(tasks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {task["task_id"]: task for task in tasks}
+
+
+def task_context_lines(
+    task: dict[str, Any],
+    *,
+    indent: str = "  ",
+    include_files: bool = False,
+    include_acceptance: bool = False,
+) -> list[str]:
+    lines: list[str] = []
+    if task.get("branch"):
+        lines.append(f"{indent}branch: {task['branch']}")
+    if task.get("source_plan"):
+        lines.append(f"{indent}source_plan: {task['source_plan']}")
+
+    handoff = task.get("handoff") or {}
+    if handoff:
+        if handoff.get("at"):
+            lines.append(f"{indent}handoff_at: {handoff['at']}")
+        if handoff.get("by"):
+            lines.append(f"{indent}handoff_by: {handoff['by']}")
+        if handoff.get("branch"):
+            lines.append(f"{indent}handoff_branch: {handoff['branch']}")
+        if handoff.get("pr_url"):
+            lines.append(f"{indent}handoff_pr_url: {handoff['pr_url']}")
+        if handoff.get("commit"):
+            lines.append(f"{indent}handoff_commit: {handoff['commit']}")
+        if handoff.get("summary"):
+            lines.append(f"{indent}handoff_summary: {handoff['summary']}")
+
+    review = task.get("review") or {}
+    if review:
+        if review.get("at"):
+            lines.append(f"{indent}review_at: {review['at']}")
+        if review.get("by"):
+            lines.append(f"{indent}review_by: {review['by']}")
+        if review.get("decision"):
+            lines.append(f"{indent}review_decision: {review['decision']}")
+        if review.get("summary"):
+            lines.append(f"{indent}review_summary: {review['summary']}")
+
+    if include_files:
+        for path in task.get("files", []):
+            lines.append(f"{indent}file: {path}")
+    if include_acceptance:
+        for item in task.get("acceptance", []):
+            lines.append(f"{indent}accept: {item}")
+    if task.get("note"):
+        lines.append(f"{indent}note: {task['note']}")
+    return lines
+
+
 def refresh_state(root: Path) -> dict[str, Any]:
     ensure_initialized(root)
     current = read_json(state_path(root))
@@ -269,6 +327,42 @@ def refresh_state(root: Path) -> dict[str, Any]:
     current["roles"] = refreshed_roles
     write_json(state_path(root), current)
     return current
+
+
+def auto_sync_actor(
+    root: Path,
+    *,
+    actor: str,
+    task_id: str | None,
+    branch: str | None,
+    note: str,
+) -> None:
+    role = actor_role(actor)
+    if role is None:
+        return
+
+    state = refresh_state(root)
+    role_state = default_role_state()
+    role_state.update(state["roles"].get(role, {}))
+    tasks = load_tasks(root)
+    task_lookup = tasks_by_id(tasks)
+
+    checkpoint_task_id = task_id or role_state.get("current_task_id")
+    checkpoint_branch = branch
+    if checkpoint_branch is None and checkpoint_task_id in task_lookup:
+        task = task_lookup[checkpoint_task_id]
+        handoff = task.get("handoff") or {}
+        checkpoint_branch = handoff.get("branch") or task.get("branch")
+
+    record_role_sync(
+        root,
+        role=role,
+        actor=actor,
+        task_id=checkpoint_task_id,
+        branch=checkpoint_branch,
+        note=note,
+        inbox_mtime=current_inbox_mtime(root, role),
+    )
 
 
 def record_role_sync(
@@ -425,6 +519,8 @@ def command_init(root: Path) -> int:
 
 def command_status(root: Path) -> int:
     state = refresh_state(root)
+    tasks = load_tasks(root)
+    task_lookup = tasks_by_id(tasks)
     print(f"project: {state['project']}")
     print(f"protocol: {state['protocol']}")
     print(f"updated_at: {state['updated_at']}")
@@ -456,6 +552,17 @@ def command_status(root: Path) -> int:
             f"last_sync_task_id={role_state.get('last_sync_task_id')} "
             f"last_sync_branch={role_state.get('last_sync_branch')}"
         )
+        if role_state.get("last_sync_note"):
+            print(f"    last_sync_note={role_state['last_sync_note']}")
+        current_task_id = role_state.get("current_task_id")
+        current_task = task_lookup.get(current_task_id) if current_task_id else None
+        if current_task is not None:
+            print(
+                f"    current_task: {current_task['task_id']} "
+                f"[{current_task['status']}] {current_task['title']}"
+            )
+            for line in task_context_lines(current_task, indent="      "):
+                print(line)
     return 0
 
 
@@ -467,16 +574,12 @@ def command_next(root: Path, role: str) -> int:
         return 0
     for task in tasks:
         print(f"{task['task_id']} [{task['status']}] {task['title']}")
-        if task.get("branch"):
-            print(f"  branch: {task['branch']}")
-        if task.get("source_plan"):
-            print(f"  source_plan: {task['source_plan']}")
-        for path in task.get("files", []):
-            print(f"  file: {path}")
-        for item in task.get("acceptance", []):
-            print(f"  accept: {item}")
-        if task.get("note"):
-            print(f"  note: {task['note']}")
+        for line in task_context_lines(
+            task,
+            include_files=True,
+            include_acceptance=True,
+        ):
+            print(line)
     return 0
 
 
@@ -569,6 +672,13 @@ def command_new_task(
     state["last_task_number"] = task_number
     write_json(state_path(root), state)
     refresh_state(root)
+    auto_sync_actor(
+        root,
+        actor=created_by,
+        task_id=task_id,
+        branch=task_branch,
+        note=f"auto: created {task_id}",
+    )
     print(f"created {task_id} on branch {task_branch}")
     return 0
 
@@ -581,6 +691,13 @@ def command_claim(root: Path, *, task_id: str, actor: str) -> int:
     append_history(task, actor=actor, event="claimed", detail="work started")
     save_task(root, task)
     refresh_state(root)
+    auto_sync_actor(
+        root,
+        actor=actor,
+        task_id=task_id,
+        branch=task.get("branch"),
+        note=f"auto: claimed {task_id}",
+    )
     print(f"claimed {task_id}")
     return 0
 
@@ -614,6 +731,13 @@ def command_handoff(
     append_history(task, actor=actor, event="handoff", detail=summary)
     save_task(root, task)
     refresh_state(root)
+    auto_sync_actor(
+        root,
+        actor=actor,
+        task_id=task_id,
+        branch=(branch or task.get("branch")),
+        note=f"auto: handed off {task_id} to {to_role}",
+    )
     print(f"handed off {task_id} to {to_role}")
     return 0
 
@@ -703,6 +827,13 @@ def command_review(
     append_history(task, actor=actor, event="review", detail=f"{decision}: {summary}")
     save_task(root, task)
     refresh_state(root)
+    auto_sync_actor(
+        root,
+        actor=actor,
+        task_id=task_id,
+        branch=(task.get("handoff") or {}).get("branch") or task.get("branch"),
+        note=f"auto: reviewed {task_id} ({decision})",
+    )
     print(f"recorded review for {task_id}: {decision}")
     return 0
 
@@ -718,6 +849,13 @@ def command_complete(root: Path, *, task_id: str, actor: str, summary: str) -> i
     append_history(task, actor=actor, event="completed", detail=summary)
     save_task(root, task)
     refresh_state(root)
+    auto_sync_actor(
+        root,
+        actor=actor,
+        task_id=task_id,
+        branch=(task.get("handoff") or {}).get("branch") or task.get("branch"),
+        note=f"auto: completed {task_id}",
+    )
     print(f"completed {task_id}")
     return 0
 
@@ -740,6 +878,13 @@ def command_message(
     with inbox.open("a", encoding="utf-8") as handle:
         handle.write(entry)
     refresh_state(root)
+    auto_sync_actor(
+        root,
+        actor=from_actor,
+        task_id=None,
+        branch=None,
+        note=f"auto: messaged {to_role} ({subject})",
+    )
     print(f"appended message to {inbox.relative_to(root)}")
     return 0
 
