@@ -295,6 +295,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     message.add_argument("--subject", required=True)
     message.add_argument("--body", required=True)
 
+    watch = subparsers.add_parser("watch", help="Poll for queue changes and print when state changes")
+    watch.add_argument("--role", required=True, choices=ROLES)
+    watch.add_argument("--interval", type=int, default=60, help="Poll interval in seconds (default: 60)")
+
     return parser.parse_args(argv)
 
 
@@ -570,6 +574,37 @@ def command_message(
     return 0
 
 
+def command_watch(root: Path, role: str, interval: int) -> int:
+    import time
+
+    last_snapshot = ""
+    print(f"watching queue for {role} (polling every {interval}s, ctrl-c to stop)", flush=True)
+    try:
+        while True:
+            refresh_state(root)
+            tasks = queued_tasks(load_tasks(root), role)
+            inbox = inbox_path(root, role)
+            inbox_mtime = inbox.stat().st_mtime if inbox.exists() else 0
+
+            snapshot = f"{len(tasks)}|{[t['task_id'] + ':' + t['status'] for t in tasks]}|{inbox_mtime}"
+            if snapshot != last_snapshot:
+                now = utc_now()
+                if tasks:
+                    for task in tasks:
+                        print(f"[{now}] {task['task_id']} [{task['status']}] {task['title']}", flush=True)
+                else:
+                    print(f"[{now}] no queued tasks for {role}", flush=True)
+
+                if inbox_mtime != 0 and (last_snapshot == "" or inbox_mtime > float(last_snapshot.rsplit("|", 1)[-1] or "0")):
+                    print(f"[{now}] inbox updated — check .collab/inbox/{role}.md", flush=True)
+
+                last_snapshot = snapshot
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nstopped watching")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     root = repo_root(args.root)
@@ -629,6 +664,8 @@ def main(argv: list[str] | None = None) -> int:
             subject=args.subject,
             body=args.body,
         )
+    if args.command == "watch":
+        return command_watch(root, args.role, args.interval)
     raise SystemExit(f"unknown command: {args.command}")
 
 
