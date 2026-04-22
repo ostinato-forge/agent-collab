@@ -18,8 +18,8 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 DEFAULT_PORT = 9111
@@ -32,58 +32,69 @@ def utc_now() -> datetime:
 class MessageStore:
     def __init__(self) -> None:
         self._messages: list[dict[str, Any]] = []
-        self._lock = threading.Lock()
-        self._event = threading.Event()
+        self._condition = threading.Condition()
+        self._started_at = utc_now().isoformat()
 
     def send(self, *, to: str, from_actor: str, body: str) -> dict[str, Any]:
-        msg = {
-            "id": len(self._messages) + 1,
-            "to": to,
-            "from": from_actor,
-            "body": body,
-            "at": utc_now().isoformat(),
-        }
-        with self._lock:
+        with self._condition:
+            msg = {
+                "id": len(self._messages) + 1,
+                "to": to,
+                "from": from_actor,
+                "body": body,
+                "at": utc_now().isoformat(),
+            }
             self._messages.append(msg)
-        self._event.set()
-        self._event.clear()
+            self._condition.notify_all()
         return msg
 
     def recv(self, role: str, since: datetime | None = None) -> list[dict[str, Any]]:
-        with self._lock:
-            return [
-                m
-                for m in self._messages
-                if m["to"] == role
-                and (since is None or datetime.fromisoformat(m["at"]) > since)
-            ]
+        with self._condition:
+            return self._recv_locked(role, since)
 
     def wait_for_message(self, role: str, since: datetime | None, timeout: float) -> list[dict[str, Any]]:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            msgs = self.recv(role, since)
-            if msgs:
-                return msgs
-            self._event.wait(timeout=min(1.0, deadline - time.monotonic()))
-        return []
+        with self._condition:
+            while True:
+                msgs = self._recv_locked(role, since)
+                if msgs:
+                    return msgs
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                self._condition.wait(timeout=remaining)
 
     def status(self) -> dict[str, Any]:
-        with self._lock:
+        with self._condition:
             roles: dict[str, int] = {}
             for m in self._messages:
                 roles[m["to"]] = roles.get(m["to"], 0) + 1
             return {
                 "total": len(self._messages),
                 "by_role": roles,
-                "started_at": self._started_at if hasattr(self, "_started_at") else None,
+                "started_at": self._started_at,
             }
 
     def clear(self) -> None:
-        with self._lock:
+        with self._condition:
             self._messages.clear()
+            self._condition.notify_all()
 
+    def _recv_locked(self, role: str, since: datetime | None) -> list[dict[str, Any]]:
+        return [
+            m
+            for m in self._messages
+            if m["to"] == role
+            and (since is None or datetime.fromisoformat(m["at"]) > since)
+        ]
 
-store = MessageStore()
+class BrokerHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler], store: MessageStore) -> None:
+        super().__init__(server_address, handler_class)
+        self.store = store
 
 
 class BrokerHandler(BaseHTTPRequestHandler):
@@ -92,7 +103,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/send":
             self._handle_send()
         elif parsed.path == "/clear":
-            store.clear()
+            self._store.clear()
             self._json_response({"cleared": True})
         else:
             self._json_response({"error": f"unknown path: {parsed.path}"}, status=404)
@@ -102,7 +113,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/recv":
             self._handle_recv(parsed)
         elif parsed.path == "/status":
-            self._json_response(store.status())
+            self._json_response(self._store.status())
         else:
             self._json_response({"error": f"unknown path: {parsed.path}"}, status=404)
 
@@ -116,7 +127,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not to or not text:
             self._json_response({"error": "to and body are required"}, status=400)
             return
-        msg = store.send(to=to, from_actor=from_actor, body=text)
+        msg = self._store.send(to=to, from_actor=from_actor, body=text)
         self._json_response(msg, status=201)
 
     def _handle_recv(self, parsed: Any) -> None:
@@ -132,9 +143,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         wait = float(params.get("wait", [0])[0])
 
         if wait > 0:
-            msgs = store.wait_for_message(role, since, timeout=min(wait, 60))
+            msgs = self._store.wait_for_message(role, since, timeout=min(wait, 60))
         else:
-            msgs = store.recv(role, since)
+            msgs = self._store.recv(role, since)
 
         self._json_response({"messages": msgs, "count": len(msgs)})
 
@@ -163,17 +174,21 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         pass
 
+    @property
+    def _store(self) -> MessageStore:
+        return cast(BrokerHTTPServer, self.server).store
+
+
+def make_server(host: str = "127.0.0.1", port: int = DEFAULT_PORT, *, store: MessageStore | None = None) -> BrokerHTTPServer:
+    return BrokerHTTPServer((host, port), BrokerHandler, store or MessageStore())
+
 
 def main() -> None:
     port = DEFAULT_PORT
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
 
-    class ReusableHTTPServer(HTTPServer):
-        allow_reuse_address = True
-
-    server = ReusableHTTPServer(("127.0.0.1", port), BrokerHandler)
-    store._started_at = utc_now().isoformat()
+    server = make_server(port=port)
     print(f"collab broker running on http://127.0.0.1:{port}", flush=True)
     print(f"  POST /send  {{\"to\": \"architect\", \"from\": \"builder\", \"body\": \"...\"}}", flush=True)
     print(f"  GET  /recv?role=architect[&since=<iso>][&wait=30]", flush=True)

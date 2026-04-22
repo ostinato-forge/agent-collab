@@ -24,6 +24,8 @@ python3 brokerctl.py recv --role YOUR_ROLE
 python3 brokerctl.py recv --role YOUR_ROLE --wait 30
 ```
 
+Long-poll waits run alongside `send` and `status`, so it is safe to leave a listener blocked while the peer keeps working.
+
 ## Check only new messages since a timestamp
 
 ```bash

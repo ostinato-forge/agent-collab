@@ -101,6 +101,8 @@ python3 brokerctl.py send --to architect --from-role builder \
   --body "TASK-001 ready for review PR #123"
 ```
 
+The broker is safe for concurrent long-poll listeners: an idle `recv --wait 60` no longer blocks `send` or `status` requests from other agents.
+
 Recommended split:
 - use `.collab/tasks/`, `.collab/reviews/`, and `scripts/collab.py` for lifecycle truth
 - use the broker for immediate signals like "task claimed", "PR ready", "merged", and "resume listening"
