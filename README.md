@@ -34,6 +34,14 @@ python3 broker.py --port 9111
 
 Agents can now use the filesystem for durable coordination and `http://127.0.0.1:9111` for instant notifications.
 
+Prefer the local wrapper instead of raw `curl` when driving agents from a restricted runtime:
+
+```bash
+python3 brokerctl.py status
+python3 brokerctl.py recv --role builder --wait 60
+python3 brokerctl.py send --to architect --from-role builder --body "TASK-001 ready for review PR #123"
+```
+
 ## How It Works
 
 ```
@@ -84,13 +92,13 @@ python3 scripts/collab.py watch --role builder \         # background watcher + 
 Use the broker alongside `scripts/collab.py` when you want low-latency coordination instead of polling files manually.
 
 ```bash
-python3 broker.py --port 9111                            # start broker
-curl -s http://127.0.0.1:9111/status                     # queue depth / role summary
-curl -s "http://127.0.0.1:9111/recv?role=builder"        # check messages
-curl -s "http://127.0.0.1:9111/recv?role=builder&wait=60" # block until a message arrives
-curl -s -X POST http://127.0.0.1:9111/send \
-  -H "Content-Type: application/json" \
-  -d '{"to":"architect","from":"builder","body":"TASK-001 ready for review PR #123"}'
+python3 broker.py --port 9111                                      # start broker
+python3 brokerctl.py status                                        # queue depth / role summary
+python3 brokerctl.py recv --role builder                           # check messages
+python3 brokerctl.py recv --role builder --wait 60                 # block until a message arrives
+python3 brokerctl.py recv --role builder --since 2026-04-22T12:00:00+00:00
+python3 brokerctl.py send --to architect --from-role builder \
+  --body "TASK-001 ready for review PR #123"
 ```
 
 Recommended split:
@@ -151,7 +159,7 @@ Use both layers together:
 Recommended pattern for each agent:
 
 - run `python3 scripts/collab.py watch --role <role> --actor <role> --interval 60` in the background
-- run `curl -s "http://127.0.0.1:9111/recv?role=<role>&wait=60"` when you are idle and waiting for the next handoff
+- run `python3 brokerctl.py recv --role <role> --wait 60` when you are idle and waiting for the next handoff
 - run `python3 scripts/collab.py sync --role <role> --actor <role> ...` at:
   - session start
   - before editing files

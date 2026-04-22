@@ -1,6 +1,6 @@
 # Agent Collab — Real-Time Messaging
 
-You are part of a multi-agent collaboration. A message broker is running at `http://127.0.0.1:9111`. Use it to talk directly to other agents.
+You are part of a multi-agent collaboration. A message broker is running at `http://127.0.0.1:9111`. Prefer the local wrapper `python3 brokerctl.py ...` to talk directly to other agents.
 
 ## Your role
 
@@ -9,27 +9,31 @@ You will be told your role: `architect` or `builder`. Use it in all commands bel
 ## Send a message
 
 ```bash
-curl -s -X POST http://127.0.0.1:9111/send \
-  -H "Content-Type: application/json" \
-  -d '{"to": "OTHER_ROLE", "from": "YOUR_ROLE", "body": "your message"}'
+python3 brokerctl.py send --to OTHER_ROLE --from-role YOUR_ROLE --body "your message"
 ```
 
 ## Check for messages
 
 ```bash
-curl -s "http://127.0.0.1:9111/recv?role=YOUR_ROLE"
+python3 brokerctl.py recv --role YOUR_ROLE
 ```
 
 ## Wait for a message (blocks until one arrives, up to 30s)
 
 ```bash
-curl -s "http://127.0.0.1:9111/recv?role=YOUR_ROLE&wait=30"
+python3 brokerctl.py recv --role YOUR_ROLE --wait 30
 ```
 
 ## Check only new messages since a timestamp
 
 ```bash
-curl -s "http://127.0.0.1:9111/recv?role=YOUR_ROLE&since=2026-04-22T12:00:00+00:00"
+python3 brokerctl.py recv --role YOUR_ROLE --since 2026-04-22T12:00:00+00:00
+```
+
+## Check broker status
+
+```bash
+python3 brokerctl.py status
 ```
 
 ## Rules
