@@ -179,3 +179,8 @@ A companion skill at `~/.claude/skills/collab/` provides Claude Code with struct
 ## Full Protocol Reference
 
 See [docs/protocol.md](docs/protocol.md) for the complete workflow, examples, and intervention points.
+
+## Tested With
+
+- Claude Code (architect) + Codex (builder)
+- Used on [example-org/example-repo](https://github.com/example-org/example-repo) — 14 tasks across 2 roadmap packs completed through the protocol
