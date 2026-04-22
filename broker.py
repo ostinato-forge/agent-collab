@@ -126,6 +126,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._json_response({"error": "role parameter required"}, status=400)
             return
         since_raw = params.get("since", [None])[0]
+        if since_raw:
+            since_raw = since_raw.replace(" ", "+")
         since = datetime.fromisoformat(since_raw) if since_raw else None
         wait = float(params.get("wait", [0])[0])
 
@@ -153,7 +155,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
 
     def log_message(self, format: str, *args: Any) -> None:
         pass
