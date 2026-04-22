@@ -1,0 +1,156 @@
+# Autonomous Agent Collaboration Protocol
+
+Goal: let two coding agents collaborate asynchronously in this repo without the user acting as the message router.
+
+This protocol assumes:
+- one `architect` session owns planning, task creation, review, and course-correction
+- one `builder` session owns implementation and PR updates
+- Git branches and PRs are the handoff boundary
+- repo-local `.collab/` files are the coordination bus
+
+The user stays out of band and steps in only when needed.
+
+## Canonical Files
+
+- `.collab/state.json`
+  Canonical machine-readable project state and queue summary.
+- `.collab/tasks/*.json`
+  One task per file. This is the main handoff artifact.
+- `.collab/inbox/architect.md`
+  Short messages to the architect role.
+- `.collab/inbox/builder.md`
+  Short messages to the builder role.
+- `.collab/reviews/*.md`
+  Durable review decisions and findings.
+
+## Rules
+
+1. One task, one branch, one current owner role.
+2. The current owner role is recorded in the task file as `assignee_role`.
+3. The builder does not start work without claiming a task.
+4. The architect does not review vague work; the builder hands off with a concrete summary, branch, and PR link when available.
+5. Two agents should not edit the same file set in parallel unless the user explicitly wants that risk.
+6. If review loops do not converge after two rounds, mark the task blocked and escalate to the user.
+
+## Workflow
+
+### 1. Architect creates a task
+
+Use the plan doc as the source and create a task with:
+- title
+- source plan path
+- target files
+- acceptance criteria
+- branch name
+
+Example:
+
+```bash
+python3 scripts/collab.py new-task \
+  "Pack 1: pre-flight predicate enforcement" \
+  --created-by architect \
+  --assigned-role builder \
+  --source-plan docs/superpowers/plans/2026-04-22-safety-tier-1-validation-preflight-soak-v2.md \
+  --file backend/src/app/remediation/planner.py \
+  --file backend/src/app/remediation/preflight.py \
+  --accept "Preview blocks fixes that violate device-scoped predicates" \
+  --accept "Execution path rechecks stale plans before queueing"
+```
+
+### 2. Builder picks up work
+
+The builder checks the queue:
+
+```bash
+python3 scripts/collab.py next --role builder
+```
+
+Then claims the task:
+
+```bash
+python3 scripts/collab.py claim TASK-001 --actor builder
+```
+
+### 3. Builder implements and hands off
+
+After implementation and PR creation:
+
+```bash
+python3 scripts/collab.py handoff TASK-001 \
+  --actor builder \
+  --summary "Implemented shared pre-flight evaluation and wired preview blockers" \
+  --pr-url https://github.com/example-org/example-repo/pull/123
+```
+
+That moves the task to the architect queue for review.
+
+### 4. Architect reviews
+
+```bash
+python3 scripts/collab.py next --role architect
+python3 scripts/collab.py review TASK-001 \
+  --actor architect \
+  --decision changes_requested \
+  --summary "Main flow is right, but execution-time recheck is still missing" \
+  --finding "queue-execute still accepts stale bundles without predicate revalidation"
+```
+
+Or approve:
+
+```bash
+python3 scripts/collab.py review TASK-001 \
+  --actor architect \
+  --decision approve \
+  --summary "Ready to merge after final smoke check"
+```
+
+### 5. Builder finalizes
+
+If approved and merged:
+
+```bash
+python3 scripts/collab.py complete TASK-001 \
+  --actor builder \
+  --summary "Merged after approval"
+```
+
+## Recommended Usage In a network automation project
+
+- Architect session:
+  - owns roadmap order
+  - converts plan docs into concrete tasks
+  - reviews PRs and closes the loop
+- Builder session:
+  - pulls the next task from `.collab`
+  - implements on a dedicated branch
+  - hands off through PR plus `handoff`
+
+Good first packs for this protocol:
+- `#72` + `#73` safety tier
+- `#84` selector convergence
+
+These have clear file boundaries and strong acceptance criteria already.
+
+## CLI Summary
+
+Core commands:
+- `python3 scripts/collab.py status`
+- `python3 scripts/collab.py next --role architect`
+- `python3 scripts/collab.py next --role builder`
+- `python3 scripts/collab.py new-task ...`
+- `python3 scripts/collab.py claim TASK-001 --actor builder`
+- `python3 scripts/collab.py handoff TASK-001 ...`
+- `python3 scripts/collab.py review TASK-001 ...`
+- `python3 scripts/collab.py complete TASK-001 ...`
+- `python3 scripts/collab.py message --to architect ...`
+
+## Intervention Points For The User
+
+The user can step in by:
+- editing a task file directly
+- writing into an inbox file
+- marking a task blocked
+- commenting on the PR
+- changing roadmap priority and asking the architect session to regenerate tasks
+
+That keeps the user in the tech-lead seat without forcing them to relay every message.
