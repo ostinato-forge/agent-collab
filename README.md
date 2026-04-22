@@ -2,7 +2,11 @@
 
 Repo-local async collaboration protocol for autonomous multi-agent coding workflows.
 
-Two AI coding agents coordinate through the filesystem — one architects (plans tasks, reviews PRs), one builds (implements, creates PRs). Git branches and GitHub PRs are the contract boundary. The human stays out-of-band as tech lead, stepping in only when needed.
+Two AI coding agents coordinate through two layers:
+- `.collab/` files for durable task state, inboxes, and review history
+- a lightweight local broker for real-time "your turn" signals
+
+One agent architects (plans tasks, reviews PRs), one builds (implements, creates PRs). Git branches and GitHub PRs are the contract boundary. The human stays out-of-band as tech lead, stepping in only when needed.
 
 ## Quick Start
 
@@ -21,23 +25,33 @@ python3 scripts/collab.py init
 
 This creates `.collab/` with task files, inboxes, and state tracking. Add `.collab/` to your `.gitignore` — it's ephemeral session state, not production code.
 
+Start the optional real-time broker in a second terminal:
+
+```bash
+cd /path/to/agent-collab
+python3 broker.py --port 9111
+```
+
+Agents can now use the filesystem for durable coordination and `http://127.0.0.1:9111` for instant notifications.
+
 ## How It Works
 
 ```
-Architect                           Builder
-    │                                   │
-    ├── new-task ──────────────────────► │
-    │                                   ├── claim
-    │                                   ├── implement
-    │                                   ├── git push + gh pr create
-    │ ◄──────────────────── handoff ────┤
-    ├── gh pr diff / review             │
-    ├── review (approve/changes) ──────►│
-    │                                   ├── (address feedback if needed)
-    ├── gh pr merge                     │
-    ├── complete ──────────────────────►│
-    │                                   │
-    └── (next task) ────────────────────►
+Architect                              Builder
+    │                                      │
+    ├── new-task (.collab) ──────────────► │
+    │                                      ├── claim (.collab)
+    │                                      ├── broker ping: "starting TASK-###"
+    │                                      ├── implement
+    │                                      ├── git push + gh pr create
+    │ ◄──────── broker ping + handoff ─────┤
+    ├── gh pr diff / review                │
+    ├── review (.collab) ────────────────► │
+    │                                      ├── (address feedback if needed)
+    ├── gh pr merge                        │
+    ├── complete (.collab) ──────────────► │
+    │                                      │
+    └── broker ping: next task ──────────► │
 ```
 
 ## CLI Commands
@@ -64,6 +78,26 @@ python3 scripts/collab.py message --to architect \       # async messages
 python3 scripts/collab.py watch --role builder \         # background watcher + heartbeat
   --actor builder --interval 60 --note "watching queue"
 ```
+
+## Real-Time Broker
+
+Use the broker alongside `scripts/collab.py` when you want low-latency coordination instead of polling files manually.
+
+```bash
+python3 broker.py --port 9111                            # start broker
+curl -s http://127.0.0.1:9111/status                     # queue depth / role summary
+curl -s "http://127.0.0.1:9111/recv?role=builder"        # check messages
+curl -s "http://127.0.0.1:9111/recv?role=builder&wait=60" # block until a message arrives
+curl -s -X POST http://127.0.0.1:9111/send \
+  -H "Content-Type: application/json" \
+  -d '{"to":"architect","from":"builder","body":"TASK-001 ready for review PR #123"}'
+```
+
+Recommended split:
+- use `.collab/tasks/`, `.collab/reviews/`, and `scripts/collab.py` for lifecycle truth
+- use the broker for immediate signals like "task claimed", "PR ready", "merged", and "resume listening"
+- use `/status` to confirm the broker is alive after restarts or fixes
+- use `recv?since=...` when reconnecting after an interruption so you do not replay stale messages
 
 ## Coordination Files
 
@@ -108,14 +142,16 @@ proposed → in_progress → in_review → approved → done
 
 ## Staying In Sync
 
-Use two layers together:
+Use both layers together:
 
 1. `watch` for passive notification.
 2. `sync` for explicit checkpoints and freshness tracking.
+3. broker `recv?wait=...` for instant handoffs when an agent is otherwise idle
 
 Recommended pattern for each agent:
 
 - run `python3 scripts/collab.py watch --role <role> --actor <role> --interval 60` in the background
+- run `curl -s "http://127.0.0.1:9111/recv?role=<role>&wait=60"` when you are idle and waiting for the next handoff
 - run `python3 scripts/collab.py sync --role <role> --actor <role> ...` at:
   - session start
   - before editing files
@@ -128,9 +164,17 @@ Recommended pattern for each agent:
 - whether your inbox changed since your last checkpoint
 - whether the peer role looks stale
 
+## Agent Runtime Notes
+
+- `AGENT.md` is the short operational brief for the active architect/builder session.
+- `README.md` explains the overall model and setup.
+- `docs/protocol.md` is the full reference workflow.
+
+If you are driving an agent directly, point it at `AGENT.md` first so it sees the broker commands and messaging rules immediately.
+
 ## Integration with Claude Code
 
-A companion skill at `~/.claude/skills/collab/` provides Claude Code with structured architect/builder workflows on top of this CLI. The skill is optional — agents can follow `docs/protocol.md` directly.
+A companion skill at `~/.claude/skills/collab/` provides Claude Code with structured architect/builder workflows on top of this CLI. The skill is optional — agents can follow `AGENT.md` and `docs/protocol.md` directly.
 
 ## Full Protocol Reference
 
