@@ -169,8 +169,10 @@ def main() -> None:
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
 
-    HTTPServer.allow_reuse_address = True
-    server = HTTPServer(("127.0.0.1", port), BrokerHandler)
+    class ReusableHTTPServer(HTTPServer):
+        allow_reuse_address = True
+
+    server = ReusableHTTPServer(("127.0.0.1", port), BrokerHandler)
     store._started_at = utc_now().isoformat()
     print(f"collab broker running on http://127.0.0.1:{port}", flush=True)
     print(f"  POST /send  {{\"to\": \"architect\", \"from\": \"builder\", \"body\": \"...\"}}", flush=True)
