@@ -45,6 +45,8 @@ Architect                           Builder
 ```bash
 python3 scripts/collab.py init                          # create .collab/ workspace
 python3 scripts/collab.py status                        # queue summary
+python3 scripts/collab.py sync --role builder \         # checkpoint + delta summary
+  --actor builder --note "starting work"
 python3 scripts/collab.py next --role builder            # show queued tasks for a role
 python3 scripts/collab.py new-task "title" \             # architect creates work
   --created-by architect --assigned-role builder \
@@ -59,6 +61,8 @@ python3 scripts/collab.py complete TASK-001 \            # finalize after merge
   --actor builder --summary "merged"
 python3 scripts/collab.py message --to architect \       # async messages
   --from-actor builder --subject "question" --body "..."
+python3 scripts/collab.py watch --role builder \         # background watcher + heartbeat
+  --actor builder --interval 60 --note "watching queue"
 ```
 
 ## Coordination Files
@@ -75,6 +79,14 @@ python3 scripts/collab.py message --to architect \       # async messages
   reviews/
     TASK-001-*.md           # persisted review decisions with findings
 ```
+
+`state.json` role entries now also track the last explicit sync checkpoint:
+- `last_sync_at`
+- `last_sync_by`
+- `last_sync_task_id`
+- `last_sync_branch`
+- `last_sync_note`
+- `last_inbox_mtime`
 
 ## Task Lifecycle
 
@@ -94,6 +106,28 @@ proposed → in_progress → in_review → approved → done
 4. Two agents should not edit the same file set in parallel unless the human explicitly wants that risk.
 5. If review loops do not converge after two rounds, mark the task blocked and escalate to the human.
 
+## Staying In Sync
+
+Use two layers together:
+
+1. `watch` for passive notification.
+2. `sync` for explicit checkpoints and freshness tracking.
+
+Recommended pattern for each agent:
+
+- run `python3 scripts/collab.py watch --role <role> --actor <role> --interval 60` in the background
+- run `python3 scripts/collab.py sync --role <role> --actor <role> ...` at:
+  - session start
+  - before editing files
+  - before handoff / review
+  - after review feedback lands
+  - after any long stretch of focused work
+
+`sync` tells you:
+- what changed in your queue since your last checkpoint
+- whether your inbox changed since your last checkpoint
+- whether the peer role looks stale
+
 ## Integration with Claude Code
 
 A companion skill at `~/.claude/skills/collab/` provides Claude Code with structured architect/builder workflows on top of this CLI. The skill is optional — agents can follow `docs/protocol.md` directly.
@@ -101,4 +135,3 @@ A companion skill at `~/.claude/skills/collab/` provides Claude Code with struct
 ## Full Protocol Reference
 
 See [docs/protocol.md](docs/protocol.md) for the complete workflow, examples, and intervention points.
-

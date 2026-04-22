@@ -32,6 +32,41 @@ The user stays out of band and steps in only when needed.
 5. Two agents should not edit the same file set in parallel unless the user explicitly wants that risk.
 6. If review loops do not converge after two rounds, mark the task blocked and escalate to the user.
 
+## Sync Discipline
+
+Passive watching is helpful, but it is not enough on its own. Both agents should keep explicit checkpoints so the shared state answers:
+
+- who last checked the queue
+- when they checked it
+- what task and branch they believe they are on
+- whether the peer role is stale
+
+Use two commands together:
+
+```bash
+python3 scripts/collab.py watch --role builder \
+  --actor builder --interval 60 --note "watching queue"
+
+python3 scripts/collab.py sync --role builder \
+  --actor builder --task-id TASK-001 --branch feat/example \
+  --note "starting implementation"
+```
+
+Recommended checkpoint moments:
+
+- session start
+- before file edits
+- before handoff
+- immediately after review feedback lands
+- after any long focused stretch where the peer might reasonably assume silence means drift
+
+`sync` prints:
+- queued task updates since the last checkpoint
+- whether the inbox changed since the last checkpoint
+- the peer role's last sync freshness
+
+`watch --actor ...` keeps a lightweight heartbeat warm in the background while still printing queue changes.
+
 ## Workflow
 
 ### 1. Architect creates a task
@@ -63,12 +98,15 @@ The builder checks the queue:
 
 ```bash
 python3 scripts/collab.py next --role builder
+python3 scripts/collab.py sync --role builder --actor builder --note "checking queue"
 ```
 
 Then claims the task:
 
 ```bash
 python3 scripts/collab.py claim TASK-001 --actor builder
+python3 scripts/collab.py sync --role builder --actor builder \
+  --task-id TASK-001 --branch feat/task-001 --note "claimed task"
 ```
 
 ### 3. Builder implements and hands off
@@ -76,6 +114,8 @@ python3 scripts/collab.py claim TASK-001 --actor builder
 After implementation and PR creation:
 
 ```bash
+python3 scripts/collab.py sync --role builder --actor builder \
+  --task-id TASK-001 --branch feat/task-001 --note "ready for review"
 python3 scripts/collab.py handoff TASK-001 \
   --actor builder \
   --summary "Implemented shared pre-flight evaluation and wired preview blockers" \
@@ -88,6 +128,8 @@ That moves the task to the architect queue for review.
 
 ```bash
 python3 scripts/collab.py next --role architect
+python3 scripts/collab.py sync --role architect --actor architect \
+  --task-id TASK-001 --branch feat/task-001 --note "reviewing handoff"
 python3 scripts/collab.py review TASK-001 \
   --actor architect \
   --decision changes_requested \
@@ -135,6 +177,8 @@ These have clear file boundaries and strong acceptance criteria already.
 
 Core commands:
 - `python3 scripts/collab.py status`
+- `python3 scripts/collab.py sync --role architect --actor architect ...`
+- `python3 scripts/collab.py sync --role builder --actor builder ...`
 - `python3 scripts/collab.py next --role architect`
 - `python3 scripts/collab.py next --role builder`
 - `python3 scripts/collab.py new-task ...`
@@ -143,6 +187,8 @@ Core commands:
 - `python3 scripts/collab.py review TASK-001 ...`
 - `python3 scripts/collab.py complete TASK-001 ...`
 - `python3 scripts/collab.py message --to architect ...`
+- `python3 scripts/collab.py watch --role architect --actor architect --interval 60`
+- `python3 scripts/collab.py watch --role builder --actor builder --interval 60`
 
 ## Intervention Points For The User
 

@@ -23,7 +23,7 @@ TASK_STATUSES = (
     "done",
 )
 REVIEW_DECISIONS = ("approve", "changes_requested", "blocked")
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 
 def utc_now() -> str:
@@ -59,6 +59,19 @@ def reviews_dir(root: Path) -> Path:
     return collab_dir(root) / "reviews"
 
 
+def default_role_state() -> dict[str, Any]:
+    return {
+        "current_task_id": None,
+        "queue_depth": 0,
+        "last_sync_at": None,
+        "last_sync_by": None,
+        "last_sync_task_id": None,
+        "last_sync_branch": None,
+        "last_sync_note": None,
+        "last_inbox_mtime": 0.0,
+    }
+
+
 def default_state(project_name: str) -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
@@ -79,8 +92,8 @@ def default_state(project_name: str) -> dict[str, Any]:
             "done": 0,
         },
         "roles": {
-            "architect": {"current_task_id": None, "queue_depth": 0},
-            "builder": {"current_task_id": None, "queue_depth": 0},
+            "architect": default_role_state(),
+            "builder": default_role_state(),
         },
     }
 
@@ -92,6 +105,20 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def current_inbox_mtime(root: Path, role: str) -> float:
+    inbox = inbox_path(root, role)
+    return inbox.stat().st_mtime if inbox.exists() else 0.0
 
 
 def ensure_initialized(root: Path) -> None:
@@ -230,17 +257,83 @@ def refresh_state(root: Path) -> dict[str, Any]:
     current["project"] = root.name
     current["summary"] = summary_for_tasks(tasks)
     current["updated_at"] = utc_now()
-    current["roles"] = {
-        role: {
-            "current_task_id": (
-                queued_tasks(tasks, role)[0]["task_id"] if queued_tasks(tasks, role) else None
-            ),
-            "queue_depth": len(queued_tasks(tasks, role)),
-        }
-        for role in ROLES
-    }
+    existing_roles = current.get("roles", {})
+    refreshed_roles: dict[str, dict[str, Any]] = {}
+    for role in ROLES:
+        role_tasks = queued_tasks(tasks, role)
+        role_state = default_role_state()
+        role_state.update(existing_roles.get(role, {}))
+        role_state["current_task_id"] = role_tasks[0]["task_id"] if role_tasks else None
+        role_state["queue_depth"] = len(role_tasks)
+        refreshed_roles[role] = role_state
+    current["roles"] = refreshed_roles
     write_json(state_path(root), current)
     return current
+
+
+def record_role_sync(
+    root: Path,
+    *,
+    role: str,
+    actor: str,
+    task_id: str | None,
+    branch: str | None,
+    note: str | None,
+    inbox_mtime: float,
+) -> dict[str, Any]:
+    state = refresh_state(root)
+    role_state = default_role_state()
+    role_state.update(state["roles"].get(role, {}))
+    role_state["last_sync_at"] = utc_now()
+    role_state["last_sync_by"] = actor
+    role_state["last_sync_task_id"] = task_id
+    role_state["last_sync_branch"] = branch
+    role_state["last_sync_note"] = note
+    role_state["last_inbox_mtime"] = float(inbox_mtime)
+    state["roles"][role] = role_state
+    state["updated_at"] = utc_now()
+    write_json(state_path(root), state)
+    return state
+
+
+def task_updates_since(
+    tasks: list[dict[str, Any]],
+    *,
+    role: str,
+    since: datetime | None,
+) -> list[dict[str, Any]]:
+    queue = queued_tasks(tasks, role)
+    if since is None:
+        return queue
+    updated: list[dict[str, Any]] = []
+    for task in queue:
+        updated_at = parse_timestamp(task.get("updated_at"))
+        if updated_at is not None and updated_at > since:
+            updated.append(task)
+    return updated
+
+
+def peer_sync_summary(
+    state: dict[str, Any],
+    *,
+    role: str,
+    max_age_seconds: int,
+) -> tuple[str, str]:
+    peer_role = next(item for item in ROLES if item != role)
+    peer_state = default_role_state()
+    peer_state.update(state["roles"].get(peer_role, {}))
+    peer_sync_at = parse_timestamp(peer_state.get("last_sync_at"))
+    if peer_sync_at is None:
+        return peer_role, "never synced"
+
+    age_seconds = int((datetime.now(timezone.utc) - peer_sync_at).total_seconds())
+    freshness = "STALE" if age_seconds > max_age_seconds else "fresh"
+    summary = (
+        f"last_sync_at={peer_state.get('last_sync_at')} "
+        f"last_sync_by={peer_state.get('last_sync_by')} "
+        f"age_seconds={age_seconds} status={freshness}"
+    )
+    return peer_role, summary
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -253,6 +346,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     next_parser = subparsers.add_parser("next", help="Show queued tasks for a role")
     next_parser.add_argument("--role", required=True, choices=ROLES)
+
+    sync = subparsers.add_parser("sync", help="Record a sync checkpoint and show what changed")
+    sync.add_argument("--role", required=True, choices=ROLES)
+    sync.add_argument("--actor", required=True)
+    sync.add_argument("--task-id")
+    sync.add_argument("--branch")
+    sync.add_argument("--note")
+    sync.add_argument(
+        "--max-age-seconds",
+        type=int,
+        default=600,
+        help="Warn when the peer role has not synced within this threshold (default: 600)",
+    )
 
     new_task = subparsers.add_parser("new-task", help="Create a new task")
     new_task.add_argument("title")
@@ -298,6 +404,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     watch = subparsers.add_parser("watch", help="Poll for queue changes and print when state changes")
     watch.add_argument("--role", required=True, choices=ROLES)
     watch.add_argument("--interval", type=int, default=60, help="Poll interval in seconds (default: 60)")
+    watch.add_argument("--actor", help="Record sync heartbeats for this actor while watching")
+    watch.add_argument("--note", default="watching queue", help="Checkpoint note to record when --actor is set")
+    watch.add_argument(
+        "--max-age-seconds",
+        type=int,
+        default=600,
+        help="Warn when the peer role has not synced within this threshold (default: 600)",
+    )
 
     return parser.parse_args(argv)
 
@@ -334,7 +448,13 @@ def command_status(root: Path) -> int:
     for role in ROLES:
         role_state = state["roles"][role]
         print(
-            f"  {role}: queue_depth={role_state['queue_depth']} current_task_id={role_state['current_task_id']}"
+            f"  {role}: "
+            f"queue_depth={role_state['queue_depth']} "
+            f"current_task_id={role_state['current_task_id']} "
+            f"last_sync_at={role_state.get('last_sync_at')} "
+            f"last_sync_by={role_state.get('last_sync_by')} "
+            f"last_sync_task_id={role_state.get('last_sync_task_id')} "
+            f"last_sync_branch={role_state.get('last_sync_branch')}"
         )
     return 0
 
@@ -357,6 +477,56 @@ def command_next(root: Path, role: str) -> int:
             print(f"  accept: {item}")
         if task.get("note"):
             print(f"  note: {task['note']}")
+    return 0
+
+
+def command_sync(
+    root: Path,
+    *,
+    role: str,
+    actor: str,
+    task_id: str | None,
+    branch: str | None,
+    note: str | None,
+    max_age_seconds: int,
+) -> int:
+    state = refresh_state(root)
+    role_state = default_role_state()
+    role_state.update(state["roles"].get(role, {}))
+    previous_sync_at = parse_timestamp(role_state.get("last_sync_at"))
+    previous_inbox_mtime = float(role_state.get("last_inbox_mtime") or 0.0)
+    tasks = load_tasks(root)
+    queue = queued_tasks(tasks, role)
+    updates = task_updates_since(tasks, role=role, since=previous_sync_at)
+    inbox_mtime = current_inbox_mtime(root, role)
+    inbox_updated = inbox_mtime > previous_inbox_mtime
+    checkpoint_task_id = task_id or role_state.get("current_task_id")
+
+    print(f"sync {role} by {actor} at {utc_now()}")
+    print(f"  queue_depth={len(queue)} current_task_id={role_state.get('current_task_id')}")
+    if updates:
+        print("  task updates since last sync:")
+        for task in updates:
+            print(f"    - {task['task_id']} [{task['status']}] {task['title']}")
+    else:
+        print("  no task updates since last sync")
+    if inbox_updated:
+        print("  inbox updated since last sync")
+    else:
+        print("  inbox unchanged since last sync")
+
+    peer_role, peer_summary = peer_sync_summary(state, role=role, max_age_seconds=max_age_seconds)
+    print(f"  peer {peer_role}: {peer_summary}")
+
+    record_role_sync(
+        root,
+        role=role,
+        actor=actor,
+        task_id=checkpoint_task_id,
+        branch=branch,
+        note=note,
+        inbox_mtime=inbox_mtime,
+    )
     return 0
 
 
@@ -574,17 +744,36 @@ def command_message(
     return 0
 
 
-def command_watch(root: Path, role: str, interval: int) -> int:
+def command_watch(
+    root: Path,
+    role: str,
+    interval: int,
+    *,
+    actor: str | None,
+    note: str | None,
+    max_age_seconds: int,
+) -> int:
     import time
 
     last_snapshot = ""
     print(f"watching queue for {role} (polling every {interval}s, ctrl-c to stop)", flush=True)
     try:
         while True:
-            refresh_state(root)
+            state = refresh_state(root)
             tasks = queued_tasks(load_tasks(root), role)
-            inbox = inbox_path(root, role)
-            inbox_mtime = inbox.stat().st_mtime if inbox.exists() else 0
+            inbox_mtime = current_inbox_mtime(root, role)
+            current_task_id = tasks[0]["task_id"] if tasks else None
+
+            if actor:
+                state = record_role_sync(
+                    root,
+                    role=role,
+                    actor=actor,
+                    task_id=current_task_id,
+                    branch=None,
+                    note=note,
+                    inbox_mtime=inbox_mtime,
+                )
 
             snapshot = f"{len(tasks)}|{[t['task_id'] + ':' + t['status'] for t in tasks]}|{inbox_mtime}"
             if snapshot != last_snapshot:
@@ -597,6 +786,13 @@ def command_watch(root: Path, role: str, interval: int) -> int:
 
                 if inbox_mtime != 0 and (last_snapshot == "" or inbox_mtime > float(last_snapshot.rsplit("|", 1)[-1] or "0")):
                     print(f"[{now}] inbox updated — check .collab/inbox/{role}.md", flush=True)
+
+                peer_role, peer_summary = peer_sync_summary(
+                    state,
+                    role=role,
+                    max_age_seconds=max_age_seconds,
+                )
+                print(f"[{now}] peer {peer_role}: {peer_summary}", flush=True)
 
                 last_snapshot = snapshot
             time.sleep(interval)
@@ -615,6 +811,16 @@ def main(argv: list[str] | None = None) -> int:
         return command_status(root)
     if args.command == "next":
         return command_next(root, args.role)
+    if args.command == "sync":
+        return command_sync(
+            root,
+            role=args.role,
+            actor=args.actor,
+            task_id=args.task_id,
+            branch=args.branch,
+            note=args.note,
+            max_age_seconds=args.max_age_seconds,
+        )
     if args.command == "new-task":
         return command_new_task(
             root,
@@ -665,7 +871,14 @@ def main(argv: list[str] | None = None) -> int:
             body=args.body,
         )
     if args.command == "watch":
-        return command_watch(root, args.role, args.interval)
+        return command_watch(
+            root,
+            args.role,
+            args.interval,
+            actor=args.actor,
+            note=args.note,
+            max_age_seconds=args.max_age_seconds,
+        )
     raise SystemExit(f"unknown command: {args.command}")
 
 
