@@ -705,9 +705,9 @@ def role_priority(role: str, task: dict[str, Any]) -> tuple[int, str, str]:
     if role == "builder":
         priorities = {
             "changes_requested": 0,
-            "approved": 1,
-            "proposed": 2,
-            "in_progress": 3,
+            "in_progress": 1,
+            "approved": 2,
+            "proposed": 3,
             "blocked": 4,
             "in_review": 5,
             "done": 6,

@@ -184,6 +184,24 @@ def test_state_changing_commands_auto_sync_actor_role(tmp_path) -> None:
     assert builder_state["last_sync_note"] == "auto: claimed TASK-001"
 
 
+def test_builder_queue_prefers_in_progress_work_over_new_proposed_tasks(tmp_path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    collab.command_init(root)
+    create_task(root, title="Current task", branch="feat/current-task")
+    create_task(root, title="Next task", branch="feat/next-task")
+
+    collab.command_claim(root, task_id="TASK-001", actor="builder")
+
+    tasks = collab.load_tasks(root)
+    queue = collab.queued_tasks(tasks, "builder")
+    assert [task["task_id"] for task in queue[:2]] == ["TASK-001", "TASK-002"]
+
+    state = collab.build_refreshed_state(root, state=collab.load_state(root), tasks=tasks)
+    assert state["roles"]["builder"]["current_task_id"] == "TASK-001"
+
+
 def test_command_next_includes_handoff_context(tmp_path, capsys) -> None:
     root = tmp_path / "repo"
     root.mkdir()
