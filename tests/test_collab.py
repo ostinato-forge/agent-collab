@@ -39,12 +39,47 @@ def create_task(
     )
 
 
-def stub_git_context(monkeypatch, *, branch: str, head: str) -> None:
+def stub_git_context(monkeypatch, *, branch: str | None, head: str) -> None:
     monkeypatch.setattr(
         collab,
         "git_context",
-        lambda _root: {"branch": branch, "head": head, "error": None},
+        lambda _root: {
+            "branch": branch,
+            "head": head,
+            "detached": branch is None,
+            "worktree": str(_root),
+            "git_dir": str(_root / ".git"),
+            "common_dir": str(_root / ".git"),
+            "error": None,
+        },
     )
+
+
+def write_fresh_daemon_status(
+    root: Path,
+    monkeypatch,
+    *,
+    role: str,
+    branch: str | None,
+    head: str,
+) -> None:
+    collab.write_daemon_status(
+        root,
+        role=role,
+        payload={
+            "actor": role,
+            "role": role,
+            "pid": 12345,
+            "run_mode": "foreground",
+            "started_at": collab.utc_now(),
+            "last_heartbeat_at": collab.utc_now(),
+            "last_observed_branch": branch,
+            "last_observed_head": head,
+            "status": "healthy",
+        },
+    )
+    monkeypatch.setattr(collab, "daemon_lock_is_held", lambda _root, current_role: current_role == role)
+    monkeypatch.setattr(collab, "daemon_pid_is_alive", lambda pid: pid == 12345)
 
 
 def test_record_role_sync_persists_checkpoint_metadata(tmp_path) -> None:
@@ -830,3 +865,142 @@ def test_foreground_daemon_allows_hard_mode_handoff(tmp_path, monkeypatch) -> No
     )
 
     assert result == 0
+
+
+def test_review_accepts_matching_sibling_worktree_for_task_branch(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="main", head="main123")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="architect",
+        role="architect",
+        peer="builder",
+        enforcement_mode="hard",
+        install_hooks=False,
+    )
+    create_task(root, branch="feat/worktree-review")
+    task = collab.load_task(root, "TASK-001")
+    task["status"] = "in_review"
+    task["assignee_role"] = "architect"
+    task["handoff"] = {
+        "at": collab.utc_now(),
+        "by": "builder",
+        "summary": "Ready",
+        "branch": "feat/worktree-review",
+        "commit": "feed123",
+    }
+    collab.save_task(root, task, touch_activity=False)
+    collab.refresh_state(root)
+    write_fresh_daemon_status(root, monkeypatch, role="architect", branch="main", head="main123")
+    monkeypatch.setattr(collab, "git_resolve_rev", lambda _root, rev: "feed123" if rev else None)
+    monkeypatch.setattr(
+        collab,
+        "git_worktree_contexts",
+        lambda _root: [
+            {
+                "path": str(tmp_path / "task-worktree"),
+                "branch": "feat/worktree-review",
+                "head": "feed123",
+                "detached": False,
+                "locked": True,
+            }
+        ],
+    )
+
+    result = collab.command_review(
+        root,
+        task_id="TASK-001",
+        actor="architect",
+        decision="approve",
+        summary="Looks good",
+        findings=[],
+        allow_unsynced=False,
+    )
+
+    assert result == 0
+    task = collab.load_task(root, "TASK-001")
+    assert task["status"] == "approved"
+
+
+def test_complete_accepts_merged_head_after_review_sync_checkpoint(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="main", head="base123")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="architect",
+        role="architect",
+        peer="builder",
+        enforcement_mode="hard",
+        install_hooks=False,
+    )
+    state = collab.read_json(collab.state_path(root))
+    assert state["roles"]["architect"]["last_observed_branch"] == "main"
+    assert state["roles"]["architect"]["last_observed_head"] == "base123"
+
+    create_task(root, branch="feat/complete-task")
+    task = collab.load_task(root, "TASK-001")
+    task["status"] = "approved"
+    task["assignee_role"] = "builder"
+    task["handoff"] = {
+        "at": collab.utc_now(),
+        "by": "builder",
+        "summary": "Ready",
+        "branch": "feat/complete-task",
+        "commit": "feed123",
+    }
+    task["review"] = {
+        "at": collab.utc_now(),
+        "by": "architect",
+        "decision": "approve",
+        "summary": "Merged",
+        "findings": [],
+        "file": "reviews/TASK-001-approve.md",
+    }
+    collab.save_task(root, task, touch_activity=False)
+    collab.refresh_state(root)
+
+    stub_git_context(monkeypatch, branch="main", head="merge999")
+    write_fresh_daemon_status(root, monkeypatch, role="architect", branch="main", head="merge999")
+    monkeypatch.setattr(collab, "git_resolve_rev", lambda _root, rev: "feed123" if rev else None)
+    monkeypatch.setattr(
+        collab,
+        "git_ref_is_ancestor",
+        lambda _root, ancestor, descendant: (ancestor, descendant) == ("feed123", "merge999"),
+    )
+
+    result = collab.command_complete(
+        root,
+        task_id="TASK-001",
+        actor="architect",
+        summary="Merged to main",
+        allow_unsynced=False,
+    )
+
+    assert result == 0
+    task = collab.load_task(root, "TASK-001")
+    assert task["status"] == "done"
+
+
+def test_run_verification_accepts_detached_head_at_task_tip(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch=None, head="feed123")
+    monkeypatch.setattr(collab, "git_resolve_rev", lambda _root, rev: "feed123" if rev else None)
+
+    verification = collab.run_verification(
+        root,
+        {
+            "task_id": "TASK-001",
+            "branch": "feat/detached-tip",
+            "verification_cmd": ["python3", "-c", "print('ok')"],
+        },
+    )
+
+    assert verification["passed"] is True
+    assert verification["exit_code"] == 0

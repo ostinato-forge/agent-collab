@@ -170,6 +170,11 @@ def default_role_state() -> dict[str, Any]:
         "last_sync_task_id": None,
         "last_sync_branch": None,
         "last_sync_head": None,
+        "last_observed_branch": None,
+        "last_observed_head": None,
+        "last_observed_worktree": None,
+        "last_observed_git_dir": None,
+        "last_observed_common_dir": None,
         "last_sync_source": None,
         "last_sync_reason": None,
         "last_sync_note": None,
@@ -942,6 +947,7 @@ def update_role_sync(
 ) -> dict[str, Any]:
     role_state = default_role_state()
     role_state.update(state["roles"].get(role, {}))
+    observed = git_context(root)
     checkpoint_task_id = canonical_task_id(task_id) or canonical_task_id(
         role_state.get("current_task_id")
     )
@@ -957,6 +963,11 @@ def update_role_sync(
     role_state["last_sync_task_id"] = checkpoint_task_id
     role_state["last_sync_branch"] = checkpoint_branch
     role_state["last_sync_head"] = checkpoint_head
+    role_state["last_observed_branch"] = observed.get("branch")
+    role_state["last_observed_head"] = observed.get("head")
+    role_state["last_observed_worktree"] = observed.get("worktree")
+    role_state["last_observed_git_dir"] = observed.get("git_dir")
+    role_state["last_observed_common_dir"] = observed.get("common_dir")
     role_state["last_sync_source"] = sync_source
     role_state["last_sync_reason"] = sync_reason or note
     role_state["last_sync_note"] = note
@@ -1167,25 +1178,204 @@ def check_stale_tasks(
         return stale_tasks, newly_flagged
 
 
+def normalize_git_branch(branch: str | None) -> str | None:
+    if branch in (None, "", "HEAD"):
+        return None
+    if branch.startswith("refs/heads/"):
+        return branch.removeprefix("refs/heads/")
+    return branch
+
+
+def git_capture(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def resolve_git_path(root: Path, value: str | None) -> str | None:
+    if not value:
+        return None
+    path = Path(value)
+    if path.is_absolute():
+        return str(path)
+    return str((root / path).resolve())
+
+
+def git_resolve_rev(root: Path, rev: str | None) -> str | None:
+    if not rev:
+        return None
+    try:
+        return git_capture(root, "rev-parse", rev)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def git_ref_is_ancestor(root: Path, ancestor: str | None, descendant: str | None) -> bool:
+    if not ancestor or not descendant:
+        return False
+    try:
+        completed = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False
+    return completed.returncode == 0
+
+
+def git_worktree_contexts(root: Path) -> list[dict[str, Any]]:
+    try:
+        output = git_capture(root, "worktree", "list", "--porcelain")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    current: dict[str, Any] = {}
+    for raw_line in [*output.splitlines(), ""]:
+        if not raw_line:
+            if current:
+                current.setdefault("path", None)
+                current.setdefault("head", None)
+                current.setdefault("branch", None)
+                current.setdefault("detached", False)
+                current.setdefault("locked", False)
+                entries.append(current)
+                current = {}
+            continue
+        key, _, value = raw_line.partition(" ")
+        if key == "worktree":
+            current["path"] = value
+        elif key == "HEAD":
+            current["head"] = value
+        elif key == "branch":
+            current["branch"] = normalize_git_branch(value)
+        elif key == "detached":
+            current["detached"] = True
+        elif key == "locked":
+            current["locked"] = value or True
+        elif key == "prunable":
+            current["prunable"] = value or True
+        elif key == "bare":
+            current["bare"] = True
+    return entries
+
+
+def task_target_branch(task: dict[str, Any]) -> str | None:
+    handoff = task.get("handoff") or {}
+    return handoff.get("branch") or task.get("branch")
+
+
+def task_target_head(root: Path, task: dict[str, Any]) -> str | None:
+    handoff = task.get("handoff") or {}
+    verification = task.get("verification") or {}
+    for candidate in (
+        handoff.get("commit"),
+        verification.get("head"),
+        handoff.get("branch"),
+        task.get("branch"),
+    ):
+        resolved = git_resolve_rev(root, candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def task_checkout_alignment(
+    root: Path,
+    *,
+    task: dict[str, Any],
+    git: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current = git or git_context(root)
+    expected_branch = task_target_branch(task)
+    expected_head = task_target_head(root, task)
+    current_branch = normalize_git_branch(current.get("branch"))
+    current_head = current.get("head")
+    branch_at_target = (
+        expected_branch is not None
+        and current_branch == expected_branch
+        and (expected_head is None or current_head == expected_head)
+    )
+    head_at_target = expected_head is not None and current_head == expected_head
+    matching_worktree = None
+    if expected_branch is not None:
+        for item in git_worktree_contexts(root):
+            if item.get("branch") != expected_branch:
+                continue
+            if expected_head is not None and item.get("head") not in (None, expected_head):
+                continue
+            matching_worktree = item
+            break
+    current_contains_target = (
+        expected_head is not None
+        and current_head is not None
+        and git_ref_is_ancestor(root, expected_head, current_head)
+    )
+    direct_match = branch_at_target or head_at_target
+    return {
+        "expected_branch": expected_branch,
+        "expected_head": expected_head,
+        "current_branch": current_branch,
+        "current_head": current_head,
+        "direct_match": direct_match,
+        "worktree_match": matching_worktree is not None,
+        "matching_worktree": matching_worktree,
+        "current_contains_target": current_contains_target,
+        "review_ok": direct_match or matching_worktree is not None,
+        "complete_ok": direct_match or current_contains_target,
+    }
+
+
+def task_alignment_issue(task_id: str, alignment: dict[str, Any], *, context: str) -> str:
+    expected_branch = alignment.get("expected_branch")
+    expected_head = alignment.get("expected_head")
+    current_branch = alignment.get("current_branch") or "detached HEAD"
+    current_head = alignment.get("current_head")
+    head_label = expected_head[:12] if isinstance(expected_head, str) else None
+    current_label = current_head[:12] if isinstance(current_head, str) else "unknown"
+
+    if context == "review":
+        target = expected_branch or head_label or "task checkout"
+        return (
+            f"current task {task_id} is not available for review in this checkout: "
+            f"expected {target}, current checkout is {current_branch}@{current_label}, "
+            "and no matching task worktree was found"
+        )
+    if context == "complete":
+        target = head_label or expected_branch or "task checkout"
+        return (
+            f"current task {task_id} is not merged into the current HEAD "
+            f"and this checkout is not at {target}"
+        )
+    if expected_branch:
+        return f"current task {task_id} expects branch {expected_branch}, got {current_branch}"
+    if head_label:
+        return f"current task {task_id} expects HEAD {head_label}, got {current_label}"
+    return f"current task {task_id} is not aligned with the current checkout"
+
+
 def git_context(root: Path) -> dict[str, Any]:
     try:
-        branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
+        raw_branch = git_capture(root, "rev-parse", "--abbrev-ref", "HEAD")
+        head = git_capture(root, "rev-parse", "HEAD")
+        git_dir = resolve_git_path(root, git_capture(root, "rev-parse", "--git-dir"))
+        common_dir = resolve_git_path(root, git_capture(root, "rev-parse", "--git-common-dir"))
+        worktree = git_capture(root, "rev-parse", "--show-toplevel")
+        branch = normalize_git_branch(raw_branch)
         return {
             "branch": branch,
             "head": head,
+            "detached": raw_branch == "HEAD",
+            "worktree": worktree,
+            "git_dir": git_dir,
+            "common_dir": common_dir,
             "error": None,
         }
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
@@ -1193,6 +1383,10 @@ def git_context(root: Path) -> dict[str, Any]:
         return {
             "branch": None,
             "head": None,
+            "detached": None,
+            "worktree": None,
+            "git_dir": None,
+            "common_dir": None,
             "error": detail or "git context unavailable",
         }
 
@@ -1431,6 +1625,7 @@ def sync_readiness(
     actor: str,
     role: str,
     context: str,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     agent = load_agent_config(root, role=role)
     mode = (agent or {}).get("enforcement_mode", "off")
@@ -1456,19 +1651,38 @@ def sync_readiness(
 
     current_branch = git.get("branch")
     current_head = git.get("head")
-    last_branch = role_state.get("last_sync_branch")
-    last_head = role_state.get("last_sync_head")
+    last_branch = role_state.get("last_observed_branch")
+    last_head = role_state.get("last_observed_head")
+    if context not in ("review", "complete"):
+        last_branch = last_branch or role_state.get("last_sync_branch")
+        last_head = last_head or role_state.get("last_sync_head")
 
-    if current_branch and last_branch and current_branch != last_branch:
+    active_task_id = canonical_task_id(task_id) or canonical_task_id(role_state.get("current_task_id"))
+    active_task = tasks_by_id(load_tasks(root)).get(active_task_id) if active_task_id else None
+    alignment = task_checkout_alignment(root, task=active_task, git=git) if active_task is not None else None
+    suppress_branch_drift = bool(alignment and alignment.get("direct_match"))
+    suppress_head_drift = bool(
+        alignment
+        and (
+            alignment.get("direct_match")
+            or (context == "complete" and alignment.get("current_contains_target"))
+        )
+    )
+
+    if current_branch and last_branch and current_branch != last_branch and not suppress_branch_drift:
         issues.append(f"current branch {current_branch} differs from last sync {last_branch}")
-    if current_head and last_head and current_head != last_head:
+    if current_head and last_head and current_head != last_head and not suppress_head_drift:
         issues.append(f"current HEAD {current_head} differs from last sync {last_head}")
 
-    task_id = canonical_task_id(role_state.get("current_task_id"))
-    if task_id:
-        task = tasks_by_id(load_tasks(root)).get(task_id)
-        if task is not None and task.get("branch") and current_branch and task["branch"] != current_branch:
-            issues.append(f"current task {task_id} expects branch {task['branch']}, got {current_branch}")
+    if active_task_id and alignment is not None:
+        if context == "review":
+            aligned = bool(alignment.get("review_ok"))
+        elif context == "complete":
+            aligned = bool(alignment.get("complete_ok"))
+        else:
+            aligned = bool(alignment.get("direct_match"))
+        if not aligned:
+            issues.append(task_alignment_issue(active_task_id, alignment, context=context))
 
     daemon_health_state, daemon_age = daemon_health(root=root, role=role, payload=daemon)
     if mode != "off" and daemon_health_state != "fresh":
@@ -1484,6 +1698,7 @@ def sync_readiness(
     verdict["daemon_age_seconds"] = daemon_age
     verdict["actor"] = actor
     verdict["role"] = role
+    verdict["task_alignment"] = alignment
     return verdict
 
 
@@ -1494,8 +1709,9 @@ def ensure_sync_ready(
     role: str,
     context: str,
     allow_unsynced: bool,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
-    readiness = sync_readiness(root, actor=actor, role=role, context=context)
+    readiness = sync_readiness(root, actor=actor, role=role, context=context, task_id=task_id)
     if readiness["ok"] or allow_unsynced:
         return readiness
     issues = "; ".join(readiness["issues"])
@@ -1570,8 +1786,9 @@ def run_verification(root: Path, task: dict[str, Any]) -> dict[str, Any]:
         verification["output"] = context["error"]
         return verification
 
-    expected_branch = task.get("branch")
-    if expected_branch and context.get("branch") != expected_branch:
+    expected_branch = task_target_branch(task)
+    expected_head = task_target_head(root, task)
+    if expected_branch and context.get("branch") != expected_branch and context.get("head") != expected_head:
         verification["output"] = (
             f"branch mismatch: expected {expected_branch}, got {context.get('branch')}"
         )
@@ -1767,6 +1984,11 @@ def command_doctor(root: Path, *, role: str | None = None) -> int:
         f"last_sync_head={role_state.get('last_sync_head')} "
         f"last_sync_source={role_state.get('last_sync_source')}"
     )
+    if role_state.get("last_observed_branch") is not None or role_state.get("last_observed_head") is not None:
+        print(
+            f"      last_observed_branch={role_state.get('last_observed_branch')} "
+            f"last_observed_head={role_state.get('last_observed_head')}"
+        )
 
     if readiness["issues"]:
         print("issues:")
@@ -1988,6 +2210,11 @@ def command_status(root: Path) -> int:
         )
         if age_seconds is not None:
             print(f"    sync_age_seconds={age_seconds}")
+        if role_state.get("last_observed_branch") is not None or role_state.get("last_observed_head") is not None:
+            print(
+                f"    last_observed_branch={role_state.get('last_observed_branch')} "
+                f"last_observed_head={role_state.get('last_observed_head')}"
+            )
         if role_state.get("last_sync_reason"):
             print(f"    last_sync_reason={role_state['last_sync_reason']}")
         if role_state.get("last_sync_note"):
@@ -2257,6 +2484,7 @@ def command_handoff(
             role=actor_role(actor) or str(task.get("assignee_role") or "builder"),
             context="handoff",
             allow_unsynced=allow_unsynced,
+            task_id=task_id,
         )
 
         validate_transition(task, "in_review")
@@ -2365,6 +2593,7 @@ def command_review(
             role=actor_role(actor) or "architect",
             context="review",
             allow_unsynced=allow_unsynced,
+            task_id=task_id,
         )
         if task["status"] != "in_review":
             raise SystemExit(f"cannot review task in status {task['status']}")
@@ -2453,6 +2682,7 @@ def command_complete(
             role=actor_role(actor) or "builder",
             context="complete",
             allow_unsynced=allow_unsynced,
+            task_id=task_id,
         )
 
         validate_transition(task, "done")

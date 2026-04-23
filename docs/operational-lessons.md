@@ -116,6 +116,8 @@ Two concrete protocol bugs showed up in live use:
 
 - builder queue ordering must treat `in_progress` work as more important than newly `proposed` tasks
 - any logic that derives `current_task_id` from queue ordering inherits that mistake and can break branch checks, pre-push hooks, and handoff readiness
+- lifecycle checks cannot treat "not on the task branch in this checkout" as identical to "task not aligned"; review may happen with the task branch parked in a sibling worktree, and complete may happen from `main` after the task commit has been merged
+- sync metadata needs both a logical task checkpoint (`last_sync_branch` / `last_sync_head`) and the checkout that was actually observed (`last_observed_branch` / `last_observed_head`), otherwise review and complete can report false drift
 
 Practical rule: `current_task_id` should point at the task the agent is actively
 working, not merely the newest runnable item in the backlog.

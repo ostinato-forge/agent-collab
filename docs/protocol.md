@@ -129,6 +129,8 @@ Role sync entries in `.collab/state.json` now track:
 - `last_sync_task_id`
 - `last_sync_branch`
 - `last_sync_head`
+- `last_observed_branch`
+- `last_observed_head`
 - `last_sync_source`
 - `last_sync_reason`
 - `last_sync_note`
