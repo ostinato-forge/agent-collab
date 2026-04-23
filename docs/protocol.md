@@ -94,6 +94,14 @@ Recommended checkpoint moments:
 
 `watch --actor ...` keeps a lightweight heartbeat warm in the background while still printing queue changes.
 
+Use `--check-stale` on `sync` or `watch` when you want the CLI to flag long-idle `in_progress` / `in_review` tasks and notify the architect inbox without forcing a status change:
+
+```bash
+python3 scripts/collab.py sync --role builder --actor builder \
+  --task-id TASK-001 --branch feat/example --note "after tests" \
+  --check-stale
+```
+
 State-changing `collab.py` commands also auto-record sync metadata now, so `new-task`, `claim`, `handoff`, `review`, `complete`, and `message` update the role checkpoint even if the agent forgets to run a separate `sync`.
 
 ## Workflow
@@ -115,6 +123,7 @@ python3 scripts/collab.py new-task \
   --created-by architect \
   --assigned-role builder \
   --source-plan docs/superpowers/plans/2026-04-22-safety-tier-1-validation-preflight-soak-v2.md \
+  --verify-cmd "pytest -q" \
   --file backend/src/app/remediation/planner.py \
   --file backend/src/app/remediation/preflight.py \
   --accept "Preview blocks fixes that violate device-scoped predicates" \
@@ -145,11 +154,14 @@ After implementation and PR creation:
 ```bash
 python3 scripts/collab.py sync --role builder --actor builder \
   --task-id TASK-001 --branch feat/task-001 --note "ready for review"
+python3 scripts/collab.py verify TASK-001 --actor builder
 python3 scripts/collab.py handoff TASK-001 \
   --actor builder \
   --summary "Implemented shared pre-flight evaluation and wired preview blockers" \
   --pr-url https://github.com/example-org/example-repo/pull/123
 ```
+
+If a task has `--verify-arg ...` configured, `handoff` runs verification automatically and refuses the transition when verification fails or the current git branch does not match the task branch. `--skip-verify` exists for explicit emergency overrides and records that fact in task history and handoff metadata.
 
 That moves the task to the architect queue for review.
 
@@ -212,10 +224,12 @@ Core commands:
 - `python3 scripts/collab.py next --role builder`
 - `python3 scripts/collab.py new-task ...`
 - `python3 scripts/collab.py claim TASK-001 --actor builder`
+- `python3 scripts/collab.py verify TASK-001 --actor builder`
 - `python3 scripts/collab.py handoff TASK-001 ...`
 - `python3 scripts/collab.py review TASK-001 ...`
 - `python3 scripts/collab.py complete TASK-001 ...`
 - `python3 scripts/collab.py message --to architect ...`
+- `python3 scripts/collab.py check-stale --actor architect`
 - `python3 scripts/collab.py watch --role architect --actor architect --interval 60`
 - `python3 scripts/collab.py watch --role builder --actor builder --interval 60`
 

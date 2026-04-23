@@ -85,19 +85,22 @@ python3 scripts/collab.py sync --role builder \         # checkpoint + delta sum
 python3 scripts/collab.py next --role builder            # show queued tasks for a role
 python3 scripts/collab.py new-task "title" \             # architect creates work
   --created-by architect --assigned-role builder \
+  --verify-cmd "pytest -q" \
   --source-plan path/to/plan.md \
   --file src/foo.py --accept "tests pass"
 python3 scripts/collab.py claim TASK-001 --actor builder # builder starts work
+python3 scripts/collab.py verify TASK-001 --actor builder # optional explicit verification run
 python3 scripts/collab.py handoff TASK-001 \             # builder sends for review
   --actor builder --summary "done" --pr-url <url>
 python3 scripts/collab.py review TASK-001 \              # architect records decision
   --actor architect --decision approve --summary "lgtm"
 python3 scripts/collab.py complete TASK-001 \            # finalize after merge
   --actor builder --summary "merged"
+python3 scripts/collab.py check-stale --actor architect  # flag stale in-progress/review work
 python3 scripts/collab.py message --to architect \       # async messages
   --from-actor builder --subject "question" --body "..."
 python3 scripts/collab.py watch --role builder \         # background watcher + heartbeat
-  --actor builder --interval 60 --note "watching queue"
+  --actor builder --interval 60 --note "watching queue" --check-stale
 ```
 
 ## Real-Time Broker
@@ -202,6 +205,8 @@ Recommended pattern for each agent:
 - what changed in your queue since your last checkpoint
 - whether your inbox changed since your last checkpoint
 - whether the peer role looks stale
+
+Add `--check-stale` to `sync` or `watch` when you want stale `in_progress` / `in_review` tasks flagged into the architect inbox without changing task status.
 
 State-changing `collab.py` commands also auto-record sync metadata now, so silence is less likely to look like a stall.
 
