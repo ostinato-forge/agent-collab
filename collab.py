@@ -5,18 +5,29 @@ from __future__ import annotations
 
 import argparse
 import copy
-import fcntl
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 
 ROLES = ("architect", "builder")
@@ -30,10 +41,16 @@ TASK_STATUSES = (
     "done",
 )
 REVIEW_DECISIONS = ("approve", "changes_requested", "blocked")
-STATE_VERSION = 3
+ENFORCEMENT_MODES = ("off", "warn", "hard")
+SYNC_SOURCES = ("manual", "command_auto", "hook", "daemon")
+HOOK_EVENTS = ("post-checkout", "post-commit", "post-merge", "post-rewrite", "pre-push")
+HOOK_MARKER = "# agent-collab managed hook"
+STATE_VERSION = 4
 TASK_SCHEMA_VERSION = 1
 STALE_THRESHOLD_SECONDS = 86_400
 PEER_STALE_THRESHOLD_SECONDS = 180
+DAEMON_INTERVAL_SECONDS = 15
+DAEMON_STALE_THRESHOLD_SECONDS = 90
 
 TASK_STATE_MACHINE = {
     "proposed": {
@@ -100,6 +117,34 @@ def lock_path(root: Path) -> Path:
     return runtime_dir(root) / "mutation.lock"
 
 
+def daemon_lock_path(root: Path, role: str) -> Path:
+    return runtime_dir(root) / f"{role}.daemon.lock"
+
+
+def active_role_path(root: Path) -> Path:
+    return runtime_dir(root) / "active-role.txt"
+
+
+def role_runtime_path(root: Path, role: str) -> Path:
+    return runtime_dir(root) / f"{role}.json"
+
+
+def legacy_agent_config_path(root: Path) -> Path:
+    return runtime_dir(root) / "agent.json"
+
+
+def legacy_daemon_status_path(root: Path) -> Path:
+    return runtime_dir(root) / "daemon.json"
+
+
+def hooks_manifest_path(root: Path) -> Path:
+    return runtime_dir(root) / "hooks.json"
+
+
+def hooks_backup_dir(root: Path) -> Path:
+    return runtime_dir(root) / "hook-backups"
+
+
 def state_path(root: Path) -> Path:
     return collab_dir(root) / "state.json"
 
@@ -124,6 +169,9 @@ def default_role_state() -> dict[str, Any]:
         "last_sync_by": None,
         "last_sync_task_id": None,
         "last_sync_branch": None,
+        "last_sync_head": None,
+        "last_sync_source": None,
+        "last_sync_reason": None,
         "last_sync_note": None,
         "last_inbox_mtime": 0.0,
     }
@@ -191,6 +239,186 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_optional_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return read_json(path)
+
+
+def default_daemon_status() -> dict[str, Any]:
+    return {
+        "pid": None,
+        "run_mode": None,
+        "started_at": None,
+        "last_heartbeat_at": None,
+        "last_observed_branch": None,
+        "last_observed_head": None,
+        "status": "never_started",
+    }
+
+
+def default_agent_config(
+    root: Path,
+    *,
+    actor: str,
+    role: str,
+    peer: str,
+    enforcement_mode: str,
+) -> dict[str, Any]:
+    return {
+        "actor": actor,
+        "role": role,
+        "peer": peer,
+        "enforcement_mode": enforcement_mode,
+        "installed_at": utc_now(),
+        "repo_root": str(root),
+        "daemon": default_daemon_status(),
+    }
+
+
+def normalize_agent_config(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(payload)
+    daemon = default_daemon_status()
+    daemon.update(normalized.get("daemon") or {})
+    normalized["daemon"] = daemon
+    return normalized
+
+
+def configured_runtime_roles(root: Path) -> list[str]:
+    roles: list[str] = []
+    for role in ROLES:
+        if role_runtime_path(root, role).exists():
+            roles.append(role)
+            continue
+        legacy = read_optional_json(legacy_agent_config_path(root))
+        if legacy is not None and legacy.get("role") == role:
+            roles.append(role)
+    return roles
+
+
+def load_active_runtime_role(root: Path) -> str | None:
+    path = active_role_path(root)
+    if not path.exists():
+        return None
+    role = path.read_text(encoding="utf-8").strip()
+    return role if role in ROLES else None
+
+
+def set_active_runtime_role(root: Path, role: str | None) -> None:
+    path = active_role_path(root)
+    if role is None:
+        if path.exists():
+            path.unlink()
+        return
+    atomic_write_text(path, role + "\n")
+
+
+def resolve_runtime_role(root: Path, role: str | None = None) -> str | None:
+    if role is not None:
+        return role
+    active_role = load_active_runtime_role(root)
+    if active_role is not None:
+        return active_role
+    hooks_manifest = load_hooks_manifest(root) or {}
+    hook_role = hooks_manifest.get("active_role")
+    if hook_role in ROLES:
+        return hook_role
+    configured = configured_runtime_roles(root)
+    if len(configured) == 1:
+        return configured[0]
+    if not configured:
+        return None
+    raise SystemExit("multiple runtime roles configured; pass --role")
+
+
+def agent_config_path(root: Path, role: str | None = None) -> Path:
+    resolved_role = resolve_runtime_role(root, role)
+    if resolved_role is None:
+        return legacy_agent_config_path(root)
+    return role_runtime_path(root, resolved_role)
+
+
+def daemon_status_path(root: Path, role: str | None = None) -> Path:
+    resolved_role = resolve_runtime_role(root, role)
+    if resolved_role is None:
+        return legacy_daemon_status_path(root)
+    return role_runtime_path(root, resolved_role)
+
+
+def load_agent_config(root: Path, role: str | None = None) -> dict[str, Any] | None:
+    resolved_role = resolve_runtime_role(root, role)
+    if resolved_role is None:
+        return None
+    path = role_runtime_path(root, resolved_role)
+    payload = read_optional_json(path)
+    if payload is None:
+        legacy_agent = read_optional_json(legacy_agent_config_path(root))
+        if legacy_agent is None or legacy_agent.get("role") != resolved_role:
+            return None
+        payload = normalize_agent_config(legacy_agent)
+        legacy_daemon = read_optional_json(legacy_daemon_status_path(root))
+        if legacy_daemon is not None:
+            payload["daemon"].update(legacy_daemon)
+        atomic_write_json(path, payload)
+    return normalize_agent_config(payload)
+
+
+def write_agent_config(
+    root: Path,
+    *,
+    actor: str,
+    role: str,
+    peer: str,
+    enforcement_mode: str,
+) -> dict[str, Any]:
+    config = default_agent_config(
+        root,
+        actor=actor,
+        role=role,
+        peer=peer,
+        enforcement_mode=enforcement_mode,
+    )
+    existing = load_agent_config(root, role=role)
+    if existing is not None:
+        config["daemon"] = normalize_agent_config(existing)["daemon"]
+    atomic_write_json(role_runtime_path(root, role), config)
+    set_active_runtime_role(root, role)
+    return config
+
+
+def load_daemon_status(root: Path, role: str | None = None) -> dict[str, Any] | None:
+    config = load_agent_config(root, role=role)
+    if config is None:
+        return None
+    return normalize_agent_config(config)["daemon"]
+
+
+def write_daemon_status(
+    root: Path,
+    *,
+    role: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    config = load_agent_config(root, role=role)
+    if config is None:
+        raise SystemExit(f"agent runtime is not enabled for role {role}")
+    config = normalize_agent_config(config)
+    daemon = default_daemon_status()
+    daemon.update(payload)
+    config["daemon"] = daemon
+    atomic_write_json(role_runtime_path(root, role), config)
+    return daemon
+
+
+def load_hooks_manifest(root: Path) -> dict[str, Any] | None:
+    return read_optional_json(hooks_manifest_path(root))
+
+
+def write_hooks_manifest(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    atomic_write_json(hooks_manifest_path(root), payload)
+    return payload
+
+
 def parse_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -230,15 +458,115 @@ def ensure_initialized(root: Path) -> None:
         atomic_write_json(state_path(root), default_state(root.name))
 
 
+class _LockState:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.depth = 0
+        self.handle: Any | None = None
+
+
+_LOCK_STATES: dict[str, _LockState] = {}
+_LOCK_STATES_GUARD = threading.Lock()
+
+
+def _lock_state_for(root: Path) -> _LockState:
+    key = str(root)
+    with _LOCK_STATES_GUARD:
+        state = _LOCK_STATES.get(key)
+        if state is None:
+            state = _LockState()
+            _LOCK_STATES[key] = state
+        return state
+
+
+def _acquire_platform_lock(handle: Any) -> None:
+    if os.name == "nt":
+        if msvcrt is None:  # pragma: no cover - Windows import guard
+            raise SystemExit("Windows file locking support unavailable")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    if fcntl is None:  # pragma: no cover - POSIX import guard
+        raise SystemExit("POSIX file locking support unavailable")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _try_acquire_platform_lock(handle: Any) -> bool:
+    if os.name == "nt":
+        if msvcrt is None:  # pragma: no cover - Windows import guard
+            raise SystemExit("Windows file locking support unavailable")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    if fcntl is None:  # pragma: no cover - POSIX import guard
+        raise SystemExit("POSIX file locking support unavailable")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _release_platform_lock(handle: Any) -> None:
+    if os.name == "nt":
+        if msvcrt is None:  # pragma: no cover - Windows import guard
+            return
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def collab_lock(root: Path):
     ensure_initialized(root)
-    with lock_path(root).open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    state = _lock_state_for(root)
+    state.lock.acquire()
+    try:
+        if state.depth == 0:
+            handle = lock_path(root).open("a+b")
+            _acquire_platform_lock(handle)
+            state.handle = handle
+        state.depth += 1
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            state.depth -= 1
+            if state.depth == 0 and state.handle is not None:
+                handle = state.handle
+                state.handle = None
+                try:
+                    _release_platform_lock(handle)
+                finally:
+                    handle.close()
+    finally:
+        state.lock.release()
+
+
+def daemon_lock_is_held(root: Path, role: str) -> bool:
+    ensure_initialized(root)
+    handle = daemon_lock_path(root, role).open("a+b")
+    try:
+        if not _try_acquire_platform_lock(handle):
+            return True
+        _release_platform_lock(handle)
+        return False
+    finally:
+        handle.close()
 
 
 def load_state(root: Path) -> dict[str, Any]:
@@ -579,6 +907,24 @@ def resolve_checkpoint_branch(
     return handoff.get("branch") or task.get("branch")
 
 
+def resolve_sync_context(
+    root: Path,
+    tasks: list[dict[str, Any]],
+    *,
+    task_id: str | None,
+    branch: str | None,
+    head: str | None,
+) -> tuple[str | None, str | None]:
+    context = git_context(root)
+    resolved_branch = branch or context.get("branch") or resolve_checkpoint_branch(
+        tasks,
+        task_id=task_id,
+        branch=None,
+    )
+    resolved_head = head or context.get("head")
+    return resolved_branch, resolved_head
+
+
 def update_role_sync(
     state: dict[str, Any],
     tasks: list[dict[str, Any]],
@@ -588,22 +934,31 @@ def update_role_sync(
     actor: str,
     task_id: str | None,
     branch: str | None,
+    head: str | None,
     note: str | None,
     inbox_mtime: float,
+    sync_source: str,
+    sync_reason: str | None,
 ) -> dict[str, Any]:
     role_state = default_role_state()
     role_state.update(state["roles"].get(role, {}))
     checkpoint_task_id = canonical_task_id(task_id) or canonical_task_id(
         role_state.get("current_task_id")
     )
-    role_state["last_sync_at"] = utc_now()
-    role_state["last_sync_by"] = actor
-    role_state["last_sync_task_id"] = checkpoint_task_id
-    role_state["last_sync_branch"] = resolve_checkpoint_branch(
+    checkpoint_branch, checkpoint_head = resolve_sync_context(
+        root,
         tasks,
         task_id=checkpoint_task_id,
         branch=branch,
+        head=head,
     )
+    role_state["last_sync_at"] = utc_now()
+    role_state["last_sync_by"] = actor
+    role_state["last_sync_task_id"] = checkpoint_task_id
+    role_state["last_sync_branch"] = checkpoint_branch
+    role_state["last_sync_head"] = checkpoint_head
+    role_state["last_sync_source"] = sync_source
+    role_state["last_sync_reason"] = sync_reason or note
     role_state["last_sync_note"] = note
     role_state["last_inbox_mtime"] = float(inbox_mtime)
     state["roles"][role] = role_state
@@ -619,7 +974,10 @@ def auto_sync_actor_state(
     actor: str,
     task_id: str | None,
     branch: str | None,
+    head: str | None,
     note: str,
+    sync_source: str = "command_auto",
+    sync_reason: str | None = None,
 ) -> dict[str, Any]:
     role = actor_role(actor)
     if role is None:
@@ -632,8 +990,11 @@ def auto_sync_actor_state(
         actor=actor,
         task_id=task_id,
         branch=branch,
+        head=head,
         note=note,
         inbox_mtime=current_inbox_mtime(root, role),
+        sync_source=sync_source,
+        sync_reason=sync_reason,
     )
 
 
@@ -644,8 +1005,11 @@ def record_role_sync(
     actor: str,
     task_id: str | None,
     branch: str | None,
+    head: str | None,
     note: str | None,
     inbox_mtime: float,
+    sync_source: str = "manual",
+    sync_reason: str | None = None,
 ) -> dict[str, Any]:
     with collab_lock(root):
         tasks = load_tasks(root)
@@ -658,8 +1022,11 @@ def record_role_sync(
             actor=actor,
             task_id=task_id,
             branch=branch,
+            head=head,
             note=note,
             inbox_mtime=inbox_mtime,
+            sync_source=sync_source,
+            sync_reason=sync_reason,
         )
         atomic_write_json(state_path(root), state)
         return state
@@ -830,6 +1197,354 @@ def git_context(root: Path) -> dict[str, Any]:
         }
 
 
+def git_path(root: Path, relative: str) -> Path | None:
+    try:
+        resolved = subprocess.run(
+            ["git", "rev-parse", "--git-path", relative],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return Path(resolved if os.path.isabs(resolved) else root / resolved)
+
+
+def git_hooks_dir(root: Path) -> Path | None:
+    return git_path(root, "hooks")
+
+
+def default_peer(role: str) -> str:
+    return next(item for item in ROLES if item != role)
+
+
+def hook_backup_path(root: Path, hook_name: str) -> Path:
+    return hooks_backup_dir(root) / f"{hook_name}.orig"
+
+
+def hook_script_payload(
+    *,
+    root: Path,
+    role: str | None,
+    hook_name: str,
+    backup_path: Path | None,
+) -> str:
+    python_path = Path(sys.executable).resolve().as_posix()
+    script_path = Path(__file__).resolve().as_posix()
+    root_path = root.resolve().as_posix()
+    lines = [
+        "#!/bin/sh",
+        HOOK_MARKER,
+        f"# hook: {hook_name}",
+        "set -eu",
+    ]
+    if backup_path is not None:
+        backup = backup_path.resolve().as_posix()
+        lines.extend(
+            [
+                f'if [ -f "{backup}" ]; then',
+                f'  if [ -x "{backup}" ]; then',
+                f'    "{backup}" "$@"',
+                "  else",
+                f'    sh "{backup}" "$@"',
+                "  fi",
+                "fi",
+            ]
+        )
+    role_arg = f' --role "{role}"' if role is not None else ""
+    lines.append(
+        f'"{python_path}" "{script_path}" --root "{root_path}" git-event{role_arg} --event "{hook_name}" "$@"'
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def hook_manifest_entry(
+    *,
+    hook_name: str,
+    hook_path: Path,
+    backup_path: Path | None,
+) -> dict[str, Any]:
+    return {
+        "hook_path": str(hook_path),
+        "backup_path": str(backup_path) if backup_path is not None else None,
+        "managed": True,
+    }
+
+
+def install_git_hooks(root: Path, *, role: str | None = None) -> dict[str, Any]:
+    hooks_dir = git_hooks_dir(root)
+    if hooks_dir is None:
+        raise SystemExit("git hooks path unavailable; is this a git worktree?")
+
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hooks_backup_dir(root).mkdir(parents=True, exist_ok=True)
+
+    manifest = load_hooks_manifest(root) or {"installed_at": utc_now(), "hooks": {}}
+    previous_hooks = manifest.get("hooks", {})
+    installed: dict[str, Any] = {}
+
+    for hook_name in HOOK_EVENTS:
+        hook_path = hooks_dir / hook_name
+        previous_entry = previous_hooks.get(hook_name, {})
+        backup_path = (
+            Path(previous_entry["backup_path"])
+            if previous_entry.get("backup_path")
+            else None
+        )
+        if hook_path.exists():
+            current_contents = hook_path.read_text(encoding="utf-8")
+            if HOOK_MARKER not in current_contents:
+                backup_path = hook_backup_path(root, hook_name)
+                atomic_write_text(backup_path, current_contents)
+        payload = hook_script_payload(
+            root=root,
+            role=role,
+            hook_name=hook_name,
+            backup_path=backup_path if backup_path is not None and backup_path.exists() else None,
+        )
+        atomic_write_text(hook_path, payload)
+        try:
+            hook_path.chmod(0o755)
+        except OSError:
+            pass
+        installed[hook_name] = hook_manifest_entry(
+            hook_name=hook_name,
+            hook_path=hook_path,
+            backup_path=backup_path if backup_path is not None and backup_path.exists() else None,
+        )
+
+    manifest["installed_at"] = utc_now()
+    manifest["hooks"] = installed
+    manifest["active_role"] = role
+    write_hooks_manifest(root, manifest)
+    if role is not None:
+        set_active_runtime_role(root, role)
+    return manifest
+
+
+def uninstall_git_hooks(root: Path) -> dict[str, Any]:
+    manifest = load_hooks_manifest(root) or {"hooks": {}}
+    hook_entries = manifest.get("hooks", {})
+    for hook_name, entry in hook_entries.items():
+        hook_path = Path(entry.get("hook_path", ""))
+        backup_path = Path(entry["backup_path"]) if entry.get("backup_path") else None
+        if backup_path is not None and backup_path.exists():
+            atomic_write_text(hook_path, backup_path.read_text(encoding="utf-8"))
+            try:
+                hook_path.chmod(0o755)
+            except OSError:
+                pass
+        elif hook_path.exists():
+            contents = hook_path.read_text(encoding="utf-8")
+            if HOOK_MARKER in contents:
+                hook_path.unlink()
+    if hooks_manifest_path(root).exists():
+        hooks_manifest_path(root).unlink()
+    return manifest
+
+
+def daemon_status_age(payload: dict[str, Any] | None) -> int | None:
+    if not payload:
+        return None
+    heartbeat = parse_timestamp(payload.get("last_heartbeat_at"))
+    if heartbeat is None:
+        return None
+    return int((datetime.now(timezone.utc) - heartbeat).total_seconds())
+
+
+def daemon_pid_is_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def daemon_health(
+    payload: dict[str, Any] | None,
+    *,
+    root: Path | None = None,
+    role: str | None = None,
+    max_age_seconds: int = DAEMON_STALE_THRESHOLD_SECONDS,
+) -> tuple[str, int | None]:
+    if not payload:
+        return "missing", None
+    age = daemon_status_age(payload)
+    status = payload.get("status")
+    pid = payload.get("pid")
+    run_mode = payload.get("run_mode")
+    if status in (None, "never_started") and pid is None and age is None:
+        return "missing", None
+    if status == "stopped":
+        return "stopped", age
+    if run_mode == "oneshot":
+        return "oneshot", age
+    if root is not None and role is not None and not daemon_lock_is_held(root, role):
+        return "dead", age
+    if pid is None:
+        return "missing", age
+    if not daemon_pid_is_alive(pid):
+        return "dead", age
+    if age is None:
+        return "missing", None
+    if age > max_age_seconds:
+        return "stale", age
+    return "fresh", age
+
+
+def daemon_is_fresh(payload: dict[str, Any] | None, *, max_age_seconds: int = DAEMON_STALE_THRESHOLD_SECONDS) -> bool:
+    health, _ = daemon_health(payload=payload, max_age_seconds=max_age_seconds)
+    return health == "fresh"
+
+
+def load_role_state(root: Path, role: str) -> dict[str, Any]:
+    state = build_refreshed_state(root, state=load_state(root), tasks=load_tasks(root))
+    role_state = default_role_state()
+    role_state.update(state["roles"].get(role, {}))
+    return role_state
+
+
+def daemon_issue_for_health(health: str, payload: dict[str, Any] | None) -> str:
+    if health == "missing":
+        return "daemon heartbeat is missing"
+    if health == "stopped":
+        return "daemon is stopped"
+    if health == "oneshot":
+        return "daemon once does not satisfy hard mode; run daemon up"
+    if health == "dead":
+        pid = payload.get("pid") if payload else None
+        return f"daemon pid {pid} is not running"
+    if health == "stale":
+        return "daemon heartbeat is stale"
+    return "daemon state is unhealthy"
+
+
+def sync_readiness(
+    root: Path,
+    *,
+    actor: str,
+    role: str,
+    context: str,
+) -> dict[str, Any]:
+    agent = load_agent_config(root, role=role)
+    mode = (agent or {}).get("enforcement_mode", "off")
+    verdict = {
+        "ok": True,
+        "blocked": False,
+        "mode": mode,
+        "issues": [],
+        "context": context,
+    }
+    if mode == "off":
+        return verdict
+
+    git = git_context(root)
+    role_state = load_role_state(root, role)
+    daemon = load_daemon_status(root, role=role)
+
+    issues: list[str] = []
+    if agent is None:
+        issues.append("agent runtime is not enabled")
+    if git.get("error"):
+        issues.append(f"git context unavailable: {git['error']}")
+
+    current_branch = git.get("branch")
+    current_head = git.get("head")
+    last_branch = role_state.get("last_sync_branch")
+    last_head = role_state.get("last_sync_head")
+
+    if current_branch and last_branch and current_branch != last_branch:
+        issues.append(f"current branch {current_branch} differs from last sync {last_branch}")
+    if current_head and last_head and current_head != last_head:
+        issues.append(f"current HEAD {current_head} differs from last sync {last_head}")
+
+    task_id = canonical_task_id(role_state.get("current_task_id"))
+    if task_id:
+        task = tasks_by_id(load_tasks(root)).get(task_id)
+        if task is not None and task.get("branch") and current_branch and task["branch"] != current_branch:
+            issues.append(f"current task {task_id} expects branch {task['branch']}, got {current_branch}")
+
+    daemon_health_state, daemon_age = daemon_health(root=root, role=role, payload=daemon)
+    if mode != "off" and daemon_health_state != "fresh":
+        issues.append(daemon_issue_for_health(daemon_health_state, daemon))
+
+    verdict["issues"] = issues
+    verdict["ok"] = not issues
+    verdict["blocked"] = bool(issues and mode == "hard")
+    verdict["git"] = git
+    verdict["role_state"] = role_state
+    verdict["daemon"] = daemon
+    verdict["daemon_health"] = daemon_health_state
+    verdict["daemon_age_seconds"] = daemon_age
+    verdict["actor"] = actor
+    verdict["role"] = role
+    return verdict
+
+
+def ensure_sync_ready(
+    root: Path,
+    *,
+    actor: str,
+    role: str,
+    context: str,
+    allow_unsynced: bool,
+) -> dict[str, Any]:
+    readiness = sync_readiness(root, actor=actor, role=role, context=context)
+    if readiness["ok"] or allow_unsynced:
+        return readiness
+    issues = "; ".join(readiness["issues"])
+    raise SystemExit(f"{context} blocked: {issues}")
+
+
+def daemon_sync_cycle(
+    root: Path,
+    *,
+    actor: str,
+    role: str,
+    note: str | None = None,
+    run_mode: str = "foreground",
+) -> dict[str, Any]:
+    current_task_id = load_role_state(root, role).get("current_task_id")
+    state = record_role_sync(
+        root,
+        role=role,
+        actor=actor,
+        task_id=current_task_id,
+        branch=None,
+        head=None,
+        note=note or "daemon heartbeat",
+        inbox_mtime=current_inbox_mtime(root, role),
+        sync_source="daemon",
+        sync_reason="daemon poll",
+    )
+    git = git_context(root)
+    existing_daemon = load_daemon_status(root, role=role) or {}
+    daemon_payload = {
+        "actor": actor,
+        "role": role,
+        "pid": os.getpid(),
+        "run_mode": run_mode,
+        "started_at": (
+            existing_daemon.get("started_at")
+            if existing_daemon.get("pid") == os.getpid()
+            and existing_daemon.get("run_mode") == run_mode
+            else utc_now()
+        ),
+        "last_heartbeat_at": utc_now(),
+        "last_observed_branch": git.get("branch"),
+        "last_observed_head": git.get("head"),
+        "status": "healthy" if not git.get("error") else "git-error",
+    }
+    write_daemon_status(root, role=role, payload=daemon_payload)
+    return {"state": state, "daemon": daemon_payload}
+
+
 def render_command(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
@@ -933,6 +1648,286 @@ def command_init(root: Path) -> int:
     return 0
 
 
+def command_enable(
+    root: Path,
+    *,
+    actor: str,
+    role: str,
+    peer: str | None,
+    enforcement_mode: str,
+    install_hooks: bool,
+) -> int:
+    resolved_peer = peer or default_peer(role)
+    if resolved_peer == role:
+        raise SystemExit("peer role must differ from role")
+    with collab_lock(root):
+        ensure_initialized(root)
+        write_agent_config(
+            root,
+            actor=actor,
+            role=role,
+            peer=resolved_peer,
+            enforcement_mode=enforcement_mode,
+        )
+    if install_hooks:
+        install_git_hooks(root, role=role)
+    current_task_id = load_role_state(root, role).get("current_task_id")
+    record_role_sync(
+        root,
+        role=role,
+        actor=actor,
+        task_id=current_task_id,
+        branch=None,
+        head=None,
+        note=f"enabled runtime ({enforcement_mode})",
+        inbox_mtime=current_inbox_mtime(root, role),
+        sync_source="manual",
+        sync_reason="enable",
+    )
+    print(f"enabled agent runtime for {role} (actor={actor}, peer={resolved_peer}, enforce={enforcement_mode})")
+    if install_hooks:
+        print("installed git hooks")
+    print("next: collab.py daemon up")
+    print("next: collab.py doctor")
+    return 0
+
+
+def command_disable(root: Path, *, role: str | None = None, uninstall_hooks: bool) -> int:
+    resolved_role = resolve_runtime_role(root, role)
+    agent = load_agent_config(root, role=resolved_role) if resolved_role is not None else None
+    if uninstall_hooks:
+        uninstall_git_hooks(root)
+    if resolved_role is not None and role_runtime_path(root, resolved_role).exists():
+        role_runtime_path(root, resolved_role).unlink()
+    active_role = load_active_runtime_role(root)
+    if resolved_role is not None and active_role == resolved_role:
+        remaining = [item for item in configured_runtime_roles(root) if item != resolved_role]
+        set_active_runtime_role(root, remaining[0] if remaining else None)
+    print("disabled agent runtime")
+    if agent:
+        print(f"removed agent config for {agent.get('role')}")
+    return 0
+
+
+def command_install_hooks(root: Path, *, role: str | None = None) -> int:
+    resolved_role = resolve_runtime_role(root, role)
+    manifest = install_git_hooks(root, role=resolved_role)
+    print(f"installed {len(manifest.get('hooks', {}))} git hooks")
+    return 0
+
+
+def command_uninstall_hooks(root: Path) -> int:
+    manifest = uninstall_git_hooks(root)
+    print(f"restored {len(manifest.get('hooks', {}))} git hooks")
+    return 0
+
+
+def command_doctor(root: Path, *, role: str | None = None) -> int:
+    ensure_initialized(root)
+    git = git_context(root)
+    configured_roles = configured_runtime_roles(root)
+    active_role = load_active_runtime_role(root)
+    resolved_role = resolve_runtime_role(root, role)
+    agent = load_agent_config(root, role=resolved_role) if resolved_role is not None else None
+    daemon = load_daemon_status(root, role=resolved_role) if resolved_role is not None else None
+    hooks = load_hooks_manifest(root)
+
+    print(f"repo_root: {root}")
+    print(f"git_branch: {git.get('branch')}")
+    print(f"git_head: {git.get('head')}")
+    if git.get("error"):
+        print(f"git_error: {git['error']}")
+    print(f"runtime_roles: {', '.join(configured_roles) if configured_roles else 'none'}")
+    print(f"active_runtime_role: {active_role}")
+
+    if agent is None:
+        print("agent: missing")
+        return 1
+
+    inspected_role = agent["role"]
+    print(
+        f"agent: role={agent['role']} actor={agent['actor']} peer={agent.get('peer')} "
+        f"enforce={agent.get('enforcement_mode')}"
+    )
+    print(f"hooks: installed={len((hooks or {}).get('hooks', {}))}")
+    if daemon is None:
+        print("daemon: missing")
+    else:
+        daemon_state, daemon_age = daemon_health(root=root, role=inspected_role, payload=daemon)
+        print(
+            f"daemon: status={daemon.get('status')} run_mode={daemon.get('run_mode')} "
+            f"pid={daemon.get('pid')} age_seconds={daemon_age} health={daemon_state}"
+        )
+
+    readiness = sync_readiness(root, actor=agent["actor"], role=inspected_role, context="doctor")
+    role_state = readiness.get("role_state") or default_role_state()
+    print(
+        f"sync: last_sync_at={role_state.get('last_sync_at')} "
+        f"last_sync_branch={role_state.get('last_sync_branch')} "
+        f"last_sync_head={role_state.get('last_sync_head')} "
+        f"last_sync_source={role_state.get('last_sync_source')}"
+    )
+
+    if readiness["issues"]:
+        print("issues:")
+        for issue in readiness["issues"]:
+            print(f"  - {issue}")
+        return 1 if readiness["mode"] != "off" else 0
+
+    print("doctor: healthy")
+    return 0
+
+
+def command_git_event(root: Path, *, event: str, role: str | None = None) -> int:
+    resolved_role = resolve_runtime_role(root, role)
+    agent = load_agent_config(root, role=resolved_role)
+    if agent is None:
+        return 0
+    actor = agent["actor"]
+    runtime_role = agent["role"]
+    if event == "pre-push":
+        readiness = sync_readiness(root, actor=actor, role=runtime_role, context="pre-push")
+        if readiness["issues"]:
+            for issue in readiness["issues"]:
+                print(f"pre-push: {issue}", file=sys.stderr)
+        return 1 if readiness["blocked"] else 0
+
+    current_task_id = load_role_state(root, runtime_role).get("current_task_id")
+    record_role_sync(
+        root,
+        role=runtime_role,
+        actor=actor,
+        task_id=current_task_id,
+        branch=None,
+        head=None,
+        note=f"hook: {event}",
+        inbox_mtime=current_inbox_mtime(root, runtime_role),
+        sync_source="hook",
+        sync_reason=event,
+    )
+    return 0
+
+
+def command_daemon_once(root: Path, *, role: str | None = None) -> int:
+    resolved_role = resolve_runtime_role(root, role)
+    agent = load_agent_config(root, role=resolved_role)
+    if agent is None:
+        raise SystemExit("agent runtime is not enabled")
+    result = daemon_sync_cycle(
+        root,
+        actor=agent["actor"],
+        role=agent["role"],
+        note="daemon heartbeat",
+        run_mode="oneshot",
+    )
+    daemon = result["daemon"]
+    print(
+        f"daemon synced role={daemon['role']} branch={daemon.get('last_observed_branch')} "
+        f"head={daemon.get('last_observed_head')}"
+    )
+    return 0
+
+
+def command_daemon_up(root: Path, *, role: str | None = None, interval: int) -> int:
+    import time
+
+    resolved_role = resolve_runtime_role(root, role)
+    agent = load_agent_config(root, role=resolved_role)
+    if agent is None:
+        raise SystemExit("agent runtime is not enabled")
+
+    stop_event = threading.Event()
+
+    def _request_stop(_signum: int, _frame: Any) -> None:
+        stop_event.set()
+
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+
+    lock_handle = daemon_lock_path(root, agent["role"]).open("a+b")
+    daemon_locked = False
+    try:
+        daemon_locked = _try_acquire_platform_lock(lock_handle)
+        if not daemon_locked:
+            raise SystemExit(f"daemon already running for role {agent['role']}")
+        print(
+            f"daemon running for role={agent['role']} actor={agent['actor']} "
+            f"(interval={interval}s, ctrl-c to stop)",
+            flush=True,
+        )
+        try:
+            daemon_sync_cycle(
+                root,
+                actor=agent["actor"],
+                role=agent["role"],
+                note="daemon started",
+                run_mode="foreground",
+            )
+            while not stop_event.wait(interval):
+                daemon_sync_cycle(
+                    root,
+                    actor=agent["actor"],
+                    role=agent["role"],
+                    run_mode="foreground",
+                )
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+            signal.signal(signal.SIGINT, previous_sigint)
+            existing = load_daemon_status(root, role=agent["role"]) or {}
+            existing["status"] = "stopped"
+            existing["run_mode"] = "foreground"
+            existing["last_heartbeat_at"] = utc_now()
+            write_daemon_status(root, role=agent["role"], payload=existing)
+            print("daemon stopped", flush=True)
+    finally:
+        try:
+            if daemon_locked:
+                _release_platform_lock(lock_handle)
+        finally:
+            lock_handle.close()
+    return 0
+
+
+def command_daemon_status(root: Path, *, role: str | None = None) -> int:
+    resolved_role = resolve_runtime_role(root, role)
+    payload = load_daemon_status(root, role=resolved_role)
+    if payload is None:
+        print("daemon: not running")
+        return 1
+    health, age = daemon_health(root=root, role=resolved_role, payload=payload)
+    print(
+        f"daemon: status={payload.get('status')} run_mode={payload.get('run_mode')} "
+        f"role={payload.get('role')} actor={payload.get('actor')} "
+        f"pid={payload.get('pid')} age_seconds={age} health={health}"
+    )
+    print(f"  last_observed_branch={payload.get('last_observed_branch')}")
+    print(f"  last_observed_head={payload.get('last_observed_head')}")
+    return 0 if daemon_is_fresh(payload) else 1
+
+
+def command_daemon_stop(root: Path, *, role: str | None = None) -> int:
+    resolved_role = resolve_runtime_role(root, role)
+    payload = load_daemon_status(root, role=resolved_role)
+    if payload is None or payload.get("pid") is None:
+        print("daemon: no pid recorded")
+        return 1
+    if payload.get("run_mode") != "foreground":
+        print("daemon: no foreground daemon recorded")
+        return 1
+    if not daemon_lock_is_held(root, resolved_role):
+        print("daemon: no foreground daemon recorded")
+        return 1
+    pid = int(payload["pid"])
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        raise SystemExit(f"failed to stop daemon pid {pid}: {exc}") from exc
+    print(f"sent SIGTERM to daemon pid {pid}")
+    return 0
+
+
 def command_status(root: Path) -> int:
     state = build_refreshed_state(root, state=load_state(root), tasks=load_tasks(root))
     tasks = load_tasks(root)
@@ -940,6 +1935,24 @@ def command_status(root: Path) -> int:
     print(f"project: {state['project']}")
     print(f"protocol: {state['protocol']}")
     print(f"updated_at: {state['updated_at']}")
+    configured_roles = configured_runtime_roles(root)
+    active_role = load_active_runtime_role(root)
+    hooks = load_hooks_manifest(root)
+    if configured_roles:
+        print(f"runtime_roles: {', '.join(configured_roles)}")
+        print(f"active_runtime_role: {active_role}")
+        for runtime_role in configured_roles:
+            agent = load_agent_config(root, role=runtime_role)
+            daemon = load_daemon_status(root, role=runtime_role)
+            health, age = daemon_health(root=root, role=runtime_role, payload=daemon)
+            if agent is not None:
+                print(
+                    f"runtime[{runtime_role}]: actor={agent.get('actor')} peer={agent.get('peer')} "
+                    f"enforce={agent.get('enforcement_mode')} daemon_mode={daemon.get('run_mode') if daemon else None} "
+                    f"daemon_health={health} daemon_age_seconds={age}"
+                )
+    if hooks is not None:
+        print(f"hooks_installed: {len(hooks.get('hooks', {}))}")
     print("")
     print("summary:")
     for key in (
@@ -969,10 +1982,14 @@ def command_status(root: Path) -> int:
             f"last_sync_by={role_state.get('last_sync_by')} "
             f"last_sync_task_id={role_state.get('last_sync_task_id')} "
             f"last_sync_branch={role_state.get('last_sync_branch')} "
+            f"last_sync_head={role_state.get('last_sync_head')} "
+            f"last_sync_source={role_state.get('last_sync_source')} "
             f"sync_status={freshness}"
         )
         if age_seconds is not None:
             print(f"    sync_age_seconds={age_seconds}")
+        if role_state.get("last_sync_reason"):
+            print(f"    last_sync_reason={role_state['last_sync_reason']}")
         if role_state.get("last_sync_note"):
             print(f"    last_sync_note={role_state['last_sync_note']}")
         current_task_id = role_state.get("current_task_id")
@@ -1067,8 +2084,11 @@ def command_sync(
         actor=actor,
         task_id=checkpoint_task_id,
         branch=branch,
+        head=None,
         note=note,
         inbox_mtime=inbox_mtime,
+        sync_source="manual",
+        sync_reason="manual sync",
     )
     return 0
 
@@ -1130,6 +2150,7 @@ def command_new_task(
             actor=created_by,
             task_id=task_id,
             branch=task_branch,
+            head=None,
             note=f"auto: created {task_id}",
         )
         atomic_write_json(state_path(root), state)
@@ -1162,6 +2183,7 @@ def command_claim(root: Path, *, task_id: str, actor: str) -> int:
             actor=actor,
             task_id=task_id,
             branch=task.get("branch"),
+            head=None,
             note=f"auto: claimed {task_id}",
         )
         atomic_write_json(state_path(root), state)
@@ -1201,6 +2223,7 @@ def command_verify(root: Path, *, task_id: str, actor: str) -> int:
             actor=actor,
             task_id=task_id,
             branch=task.get("branch"),
+            head=None,
             note=f"auto: verified {task_id} ({verification_status(task)})",
         )
         atomic_write_json(state_path(root), state)
@@ -1220,6 +2243,7 @@ def command_handoff(
     pr_url: str | None,
     commit: str | None,
     skip_verify: bool,
+    allow_unsynced: bool,
 ) -> int:
     task_id = canonical_task_id(task_id) or task_id
     with collab_lock(root):
@@ -1227,6 +2251,13 @@ def command_handoff(
         task = tasks_by_id(tasks).get(task_id)
         if task is None:
             raise SystemExit(f"task not found: {task_id}")
+        readiness = ensure_sync_ready(
+            root,
+            actor=actor,
+            role=actor_role(actor) or str(task.get("assignee_role") or "builder"),
+            context="handoff",
+            allow_unsynced=allow_unsynced,
+        )
 
         validate_transition(task, "in_review")
 
@@ -1264,6 +2295,7 @@ def command_handoff(
                         actor=actor,
                         task_id=task_id,
                         branch=handoff_branch,
+                        head=None,
                         note=f"auto: verification failed for {task_id}",
                     )
                     atomic_write_json(state_path(root), state)
@@ -1284,6 +2316,13 @@ def command_handoff(
         )
         validate_required_fields(task, "in_review")
         task["status"] = "in_review"
+        if allow_unsynced and readiness["issues"]:
+            task["handoff"]["sync_override"] = {
+                "at": utc_now(),
+                "by": actor,
+                "issues": readiness["issues"],
+            }
+            append_history(task, actor=actor, event="sync_override", detail="handoff allowed while unsynced")
         append_history(task, actor=actor, event="handoff", detail=summary)
         save_task(root, task, touch_activity=True)
 
@@ -1295,6 +2334,7 @@ def command_handoff(
             actor=actor,
             task_id=task_id,
             branch=handoff_branch,
+            head=None,
             note=f"auto: handed off {task_id} to {to_role}",
         )
         atomic_write_json(state_path(root), state)
@@ -1311,6 +2351,7 @@ def command_review(
     decision: str,
     summary: str,
     findings: list[str],
+    allow_unsynced: bool,
 ) -> int:
     task_id = canonical_task_id(task_id) or task_id
     with collab_lock(root):
@@ -1318,6 +2359,13 @@ def command_review(
         task = tasks_by_id(tasks).get(task_id)
         if task is None:
             raise SystemExit(f"task not found: {task_id}")
+        readiness = ensure_sync_ready(
+            root,
+            actor=actor,
+            role=actor_role(actor) or "architect",
+            context="review",
+            allow_unsynced=allow_unsynced,
+        )
         if task["status"] != "in_review":
             raise SystemExit(f"cannot review task in status {task['status']}")
 
@@ -1356,6 +2404,13 @@ def command_review(
             "findings": findings,
             "file": str(review_path.relative_to(root)),
         }
+        if allow_unsynced and readiness["issues"]:
+            task["review"]["sync_override"] = {
+                "at": utc_now(),
+                "by": actor,
+                "issues": readiness["issues"],
+            }
+            append_history(task, actor=actor, event="sync_override", detail="review allowed while unsynced")
         validate_required_fields(task, new_status)
         task["status"] = new_status
         append_history(task, actor=actor, event="review", detail=f"{decision}: {summary}")
@@ -1369,6 +2424,7 @@ def command_review(
             actor=actor,
             task_id=task_id,
             branch=(task.get("handoff") or {}).get("branch") or task.get("branch"),
+            head=None,
             note=f"auto: reviewed {task_id} ({decision})",
         )
         atomic_write_json(state_path(root), state)
@@ -1377,18 +2433,34 @@ def command_review(
     return 0
 
 
-def command_complete(root: Path, *, task_id: str, actor: str, summary: str) -> int:
+def command_complete(
+    root: Path,
+    *,
+    task_id: str,
+    actor: str,
+    summary: str,
+    allow_unsynced: bool,
+) -> int:
     task_id = canonical_task_id(task_id) or task_id
     with collab_lock(root):
         tasks = load_tasks(root)
         task = tasks_by_id(tasks).get(task_id)
         if task is None:
             raise SystemExit(f"task not found: {task_id}")
+        readiness = ensure_sync_ready(
+            root,
+            actor=actor,
+            role=actor_role(actor) or "builder",
+            context="complete",
+            allow_unsynced=allow_unsynced,
+        )
 
         validate_transition(task, "done")
         task["assignee_role"] = None
         validate_required_fields(task, "done")
         task["status"] = "done"
+        if allow_unsynced and readiness["issues"]:
+            append_history(task, actor=actor, event="sync_override", detail="complete allowed while unsynced")
         append_history(task, actor=actor, event="completed", detail=summary)
         save_task(root, task, touch_activity=True)
 
@@ -1400,6 +2472,7 @@ def command_complete(root: Path, *, task_id: str, actor: str, summary: str) -> i
             actor=actor,
             task_id=task_id,
             branch=(task.get("handoff") or {}).get("branch") or task.get("branch"),
+            head=None,
             note=f"auto: completed {task_id}",
         )
         atomic_write_json(state_path(root), state)
@@ -1433,6 +2506,7 @@ def command_message(
             actor=from_actor,
             task_id=None,
             branch=None,
+            head=None,
             note=f"auto: messaged {to_role} ({subject})",
         )
         atomic_write_json(state_path(root), state)
@@ -1504,8 +2578,11 @@ def command_watch(
                     actor=actor,
                     task_id=current_task_id,
                     branch=None,
+                    head=None,
                     note=note,
                     inbox_mtime=inbox_mtime,
+                    sync_source="command_auto",
+                    sync_reason="watch heartbeat",
                 )
                 state = build_refreshed_state(root, state=load_state(root), tasks=load_tasks(root))
 
@@ -1555,6 +2632,37 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     subparsers.add_parser("init", help="Create missing .collab/ files")
     subparsers.add_parser("status", help="Show queue summary")
+
+    enable = subparsers.add_parser("enable", help="Enable runtime identity, hooks, and enforcement policy")
+    enable.add_argument("--actor", required=True)
+    enable.add_argument("--role", required=True, choices=ROLES)
+    enable.add_argument("--peer", choices=ROLES)
+    enable.add_argument("--enforce", dest="enforcement_mode", default="warn", choices=ENFORCEMENT_MODES)
+    enable.add_argument("--no-hooks", action="store_true", help="Write agent identity without installing git hooks")
+
+    disable = subparsers.add_parser("disable", help="Disable runtime identity and optionally remove hooks")
+    disable.add_argument("--role", choices=ROLES, help="Disable a specific runtime role; defaults to the active role")
+    disable.add_argument("--keep-hooks", action="store_true", help="Leave installed git hooks in place")
+
+    doctor = subparsers.add_parser("doctor", help="Inspect runtime identity, hook install, daemon health, and sync readiness")
+    doctor.add_argument("--role", choices=ROLES, help="Inspect a specific runtime role")
+    install_hooks = subparsers.add_parser("install-hooks", help="Install repo-local git hooks for auto-sync")
+    install_hooks.add_argument("--role", choices=ROLES, help="Install hooks for a specific runtime role")
+    subparsers.add_parser("uninstall-hooks", help="Restore previously chained git hooks")
+
+    git_event = subparsers.add_parser("git-event", help=argparse.SUPPRESS)
+    git_event.add_argument("--role", choices=ROLES)
+    git_event.add_argument("--event", required=True, choices=HOOK_EVENTS)
+    git_event.add_argument("hook_args", nargs="*")
+
+    daemon = subparsers.add_parser("daemon", help="Run or inspect the sync daemon")
+    daemon.add_argument("--role", choices=ROLES, help="Operate on a specific runtime role")
+    daemon_subparsers = daemon.add_subparsers(dest="daemon_command", required=True)
+    daemon_up = daemon_subparsers.add_parser("up", help="Run the daemon in the foreground")
+    daemon_up.add_argument("--interval", type=int, default=DAEMON_INTERVAL_SECONDS)
+    daemon_subparsers.add_parser("once", help="Run one daemon sync cycle")
+    daemon_subparsers.add_parser("status", help="Show daemon heartbeat status")
+    daemon_subparsers.add_parser("stop", help="Stop the recorded daemon pid")
 
     next_parser = subparsers.add_parser("next", help="Show queued tasks for a role")
     next_parser.add_argument("--role", required=True, choices=ROLES)
@@ -1634,6 +2742,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Skip configured verification and record an explicit warning",
     )
+    handoff.add_argument(
+        "--allow-unsynced",
+        action="store_true",
+        help="Allow handoff while sync readiness checks are failing and record the override",
+    )
 
     review = subparsers.add_parser("review", help="Record a review decision")
     review.add_argument("task_id")
@@ -1641,11 +2754,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     review.add_argument("--decision", required=True, choices=REVIEW_DECISIONS)
     review.add_argument("--summary", required=True)
     review.add_argument("--finding", action="append", default=[])
+    review.add_argument(
+        "--allow-unsynced",
+        action="store_true",
+        help="Allow review while sync readiness checks are failing and record the override",
+    )
 
     complete = subparsers.add_parser("complete", help="Mark a task done")
     complete.add_argument("task_id")
     complete.add_argument("--actor", required=True)
     complete.add_argument("--summary", required=True)
+    complete.add_argument(
+        "--allow-unsynced",
+        action="store_true",
+        help="Allow completion while sync readiness checks are failing and record the override",
+    )
 
     message = subparsers.add_parser("message", help="Append a short inbox message")
     message.add_argument("--to", required=True, choices=ROLES)
@@ -1711,6 +2834,35 @@ def main(argv: list[str] | None = None) -> int:
         return command_init(root)
     if args.command == "status":
         return command_status(root)
+    if args.command == "enable":
+        return command_enable(
+            root,
+            actor=args.actor,
+            role=args.role,
+            peer=args.peer,
+            enforcement_mode=args.enforcement_mode,
+            install_hooks=not args.no_hooks,
+        )
+    if args.command == "disable":
+        return command_disable(root, role=args.role, uninstall_hooks=not args.keep_hooks)
+    if args.command == "doctor":
+        return command_doctor(root, role=args.role)
+    if args.command == "install-hooks":
+        return command_install_hooks(root, role=args.role)
+    if args.command == "uninstall-hooks":
+        return command_uninstall_hooks(root)
+    if args.command == "git-event":
+        return command_git_event(root, event=args.event, role=args.role)
+    if args.command == "daemon":
+        if args.daemon_command == "up":
+            return command_daemon_up(root, role=args.role, interval=args.interval)
+        if args.daemon_command == "once":
+            return command_daemon_once(root, role=args.role)
+        if args.daemon_command == "status":
+            return command_daemon_status(root, role=args.role)
+        if args.daemon_command == "stop":
+            return command_daemon_stop(root, role=args.role)
+        raise SystemExit(f"unknown daemon command: {args.daemon_command}")
     if args.command == "next":
         return command_next(root, args.role)
     if args.command == "sync":
@@ -1758,6 +2910,7 @@ def main(argv: list[str] | None = None) -> int:
             pr_url=args.pr_url,
             commit=args.commit,
             skip_verify=args.skip_verify,
+            allow_unsynced=args.allow_unsynced,
         )
     if args.command == "review":
         return command_review(
@@ -1767,6 +2920,7 @@ def main(argv: list[str] | None = None) -> int:
             decision=args.decision,
             summary=args.summary,
             findings=args.finding,
+            allow_unsynced=args.allow_unsynced,
         )
     if args.command == "complete":
         return command_complete(
@@ -1774,6 +2928,7 @@ def main(argv: list[str] | None = None) -> int:
             task_id=args.task_id,
             actor=args.actor,
             summary=args.summary,
+            allow_unsynced=args.allow_unsynced,
         )
     if args.command == "message":
         return command_message(

@@ -39,6 +39,14 @@ def create_task(
     )
 
 
+def stub_git_context(monkeypatch, *, branch: str, head: str) -> None:
+    monkeypatch.setattr(
+        collab,
+        "git_context",
+        lambda _root: {"branch": branch, "head": head, "error": None},
+    )
+
+
 def test_record_role_sync_persists_checkpoint_metadata(tmp_path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
@@ -52,6 +60,7 @@ def test_record_role_sync_persists_checkpoint_metadata(tmp_path) -> None:
         actor="builder",
         task_id="TASK-001",
         branch="feat/builder-task",
+        head=None,
         note="starting implementation",
         inbox_mtime=0.0,
     )
@@ -62,6 +71,8 @@ def test_record_role_sync_persists_checkpoint_metadata(tmp_path) -> None:
     assert role_state["last_sync_by"] == "builder"
     assert role_state["last_sync_task_id"] == "TASK-001"
     assert role_state["last_sync_branch"] == "feat/builder-task"
+    assert role_state["last_sync_source"] == "manual"
+    assert role_state["last_sync_reason"] == "starting implementation"
     assert role_state["last_sync_note"] == "starting implementation"
     assert role_state["last_inbox_mtime"] == 0.0
 
@@ -131,6 +142,7 @@ def test_command_status_shows_role_sync_metadata(tmp_path, capsys) -> None:
         actor="builder",
         task_id="TASK-007",
         branch="feat/remediation-rollout-models",
+        head=None,
         note="implementing rollout models",
         inbox_mtime=0.0,
     )
@@ -141,6 +153,8 @@ def test_command_status_shows_role_sync_metadata(tmp_path, capsys) -> None:
     assert "last_sync_by=builder" in output
     assert "last_sync_task_id=TASK-007" in output
     assert "last_sync_branch=feat/remediation-rollout-models" in output
+    assert "last_sync_head=" in output
+    assert "last_sync_source=manual" in output
     assert "sync_status=" in output
 
 
@@ -198,6 +212,7 @@ def test_command_next_includes_handoff_context(tmp_path, capsys) -> None:
         pr_url="https://github.com/example/repo/pull/1",
         commit="abc1234",
         skip_verify=False,
+        allow_unsynced=False,
     )
 
     collab.command_next(root, "architect")
@@ -225,6 +240,7 @@ def test_invalid_transitions_are_rejected(tmp_path) -> None:
         pr_url=None,
         commit=None,
         skip_verify=False,
+        allow_unsynced=False,
     )
     collab.command_review(
         root,
@@ -233,6 +249,7 @@ def test_invalid_transitions_are_rejected(tmp_path) -> None:
         decision="approve",
         summary="Looks good",
         findings=[],
+        allow_unsynced=False,
     )
 
     with pytest.raises(SystemExit, match="approved -> in_progress"):
@@ -250,6 +267,7 @@ def test_invalid_transitions_are_rejected(tmp_path) -> None:
         pr_url=None,
         commit=None,
         skip_verify=False,
+        allow_unsynced=False,
     )
     collab.command_review(
         root,
@@ -258,10 +276,17 @@ def test_invalid_transitions_are_rejected(tmp_path) -> None:
         decision="blocked",
         summary="Blocked on upstream dependency",
         findings=[],
+        allow_unsynced=False,
     )
 
     with pytest.raises(SystemExit, match="blocked -> done"):
-        collab.command_complete(root, task_id="TASK-002", actor="builder", summary="cannot")
+        collab.command_complete(
+            root,
+            task_id="TASK-002",
+            actor="builder",
+            summary="cannot",
+            allow_unsynced=False,
+        )
 
 
 def test_task_ids_are_case_insensitive_for_cli_commands(tmp_path) -> None:
@@ -380,6 +405,7 @@ def test_handoff_rejects_failed_verification(tmp_path, monkeypatch) -> None:
             pr_url=None,
             commit=None,
             skip_verify=False,
+            allow_unsynced=False,
         )
 
     task = collab.load_task(root, "TASK-001")
@@ -453,3 +479,336 @@ def test_parallel_new_task_allocates_unique_ids(tmp_path) -> None:
     assert len(set(task_ids)) == 6
     assert task_ids == [f"TASK-{index:03d}" for index in range(1, 7)]
     assert state["last_task_number"] == 6
+
+
+def test_enable_writes_agent_config_and_installs_hooks(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    hooks_dir = root / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    stub_git_context(monkeypatch, branch="feat/runtime", head="abc123")
+    monkeypatch.setattr(collab, "git_hooks_dir", lambda _root: hooks_dir)
+
+    collab.command_init(root)
+    result = collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="warn",
+        install_hooks=True,
+    )
+
+    assert result == 0
+    agent = collab.load_agent_config(root)
+    manifest = collab.load_hooks_manifest(root)
+    assert agent is not None
+    assert agent["role"] == "builder"
+    assert agent["enforcement_mode"] == "warn"
+    assert collab.role_runtime_path(root, "builder").exists()
+    assert collab.load_active_runtime_role(root) == "builder"
+    assert manifest is not None
+    assert set(manifest["hooks"]) == set(collab.HOOK_EVENTS)
+    assert manifest["active_role"] == "builder"
+    hook_payload = (hooks_dir / "post-commit").read_text(encoding="utf-8")
+    assert collab.HOOK_MARKER in hook_payload
+    assert '--role "builder"' in hook_payload
+
+
+def test_git_event_records_hook_sync_metadata(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="feat/hook-sync", head="deadbeef")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="warn",
+        install_hooks=False,
+    )
+
+    result = collab.command_git_event(root, event="post-commit")
+
+    state = collab.read_json(collab.state_path(root))
+    role_state = state["roles"]["builder"]
+    assert result == 0
+    assert role_state["last_sync_branch"] == "feat/hook-sync"
+    assert role_state["last_sync_head"] == "deadbeef"
+    assert role_state["last_sync_source"] == "hook"
+    assert role_state["last_sync_reason"] == "post-commit"
+
+
+def test_per_role_runtime_files_can_coexist(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="feat/multi-runtime", head="abc321")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="architect",
+        role="architect",
+        peer="builder",
+        enforcement_mode="warn",
+        install_hooks=False,
+    )
+    collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="hard",
+        install_hooks=False,
+    )
+
+    architect = collab.load_agent_config(root, role="architect")
+    builder = collab.load_agent_config(root, role="builder")
+
+    assert architect is not None
+    assert builder is not None
+    assert architect["actor"] == "architect"
+    assert builder["actor"] == "builder"
+    assert architect["enforcement_mode"] == "warn"
+    assert builder["enforcement_mode"] == "hard"
+    assert collab.load_active_runtime_role(root) == "builder"
+    assert collab.role_runtime_path(root, "architect").exists()
+    assert collab.role_runtime_path(root, "builder").exists()
+
+
+def test_install_hooks_preserves_original_hook_across_reinstall(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    hooks_dir = root / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    original_hook = hooks_dir / "post-commit"
+    original_hook.write_text("#!/bin/sh\necho original-hook\n", encoding="utf-8")
+    stub_git_context(monkeypatch, branch="feat/hook-preserve", head="abc999")
+    monkeypatch.setattr(collab, "git_hooks_dir", lambda _root: hooks_dir)
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="warn",
+        install_hooks=True,
+    )
+    collab.command_install_hooks(root)
+    collab.command_uninstall_hooks(root)
+
+    restored = original_hook.read_text(encoding="utf-8")
+    assert "original-hook" in restored
+    assert collab.HOOK_MARKER not in restored
+
+
+def test_pre_push_warn_mode_reports_but_does_not_block(tmp_path, monkeypatch, capsys) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="feat/pre-push-warn", head="fade123")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="warn",
+        install_hooks=False,
+    )
+    stub_git_context(monkeypatch, branch="feat/pre-push-warn-drift", head="fade124")
+    result = collab.command_git_event(root, event="pre-push")
+    captured = capsys.readouterr()
+
+    assert result == 0
+    assert "pre-push:" in captured.err
+    assert "daemon heartbeat is missing" in captured.err
+
+
+def test_pre_push_hard_mode_blocks_without_daemon(tmp_path, monkeypatch, capsys) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="feat/pre-push-hard", head="fade456")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="hard",
+        install_hooks=False,
+    )
+    result = collab.command_git_event(root, event="pre-push")
+    captured = capsys.readouterr()
+
+    assert result == 1
+    assert "daemon heartbeat is missing" in captured.err
+
+
+def test_hard_mode_blocks_handoff_without_fresh_daemon(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="feat/hard-mode", head="beadfeed")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="hard",
+        install_hooks=False,
+    )
+    create_task(root, branch="feat/hard-mode")
+    collab.command_claim(root, task_id="TASK-001", actor="builder")
+
+    with pytest.raises(SystemExit, match="daemon heartbeat is missing"):
+        collab.command_handoff(
+            root,
+            task_id="TASK-001",
+            actor="builder",
+            to_role="architect",
+            summary="Ready",
+            branch="feat/hard-mode",
+            pr_url=None,
+            commit=None,
+            skip_verify=False,
+            allow_unsynced=False,
+        )
+
+    collab.command_handoff(
+        root,
+        task_id="TASK-001",
+        actor="builder",
+        to_role="architect",
+        summary="Ready",
+        branch="feat/hard-mode",
+        pr_url=None,
+        commit=None,
+        skip_verify=False,
+        allow_unsynced=True,
+    )
+    task = collab.load_task(root, "TASK-001")
+    assert task["handoff"]["sync_override"]["issues"] == ["daemon heartbeat is missing"]
+
+
+def test_daemon_once_does_not_satisfy_hard_mode(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="feat/daemon-ok", head="c0ffee")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="hard",
+        install_hooks=False,
+    )
+    create_task(root, branch="feat/daemon-ok")
+    collab.command_claim(root, task_id="TASK-001", actor="builder")
+
+    collab.command_daemon_once(root)
+    with pytest.raises(SystemExit, match="daemon once does not satisfy hard mode"):
+        collab.command_handoff(
+            root,
+            task_id="TASK-001",
+            actor="builder",
+            to_role="architect",
+            summary="Ready",
+            branch="feat/daemon-ok",
+            pr_url=None,
+            commit=None,
+            skip_verify=False,
+            allow_unsynced=False,
+        )
+
+    daemon = collab.load_daemon_status(root)
+    assert daemon is not None
+    assert daemon["status"] == "healthy"
+    assert daemon["run_mode"] == "oneshot"
+
+
+def test_foreground_daemon_without_lock_still_blocks_hard_mode(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="feat/daemon-lock", head="face123")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="hard",
+        install_hooks=False,
+    )
+    create_task(root, branch="feat/daemon-lock")
+    collab.command_claim(root, task_id="TASK-001", actor="builder")
+    collab.daemon_sync_cycle(
+        root,
+        actor="builder",
+        role="builder",
+        run_mode="foreground",
+    )
+
+    with pytest.raises(SystemExit, match="daemon pid .* is not running"):
+        collab.command_handoff(
+            root,
+            task_id="TASK-001",
+            actor="builder",
+            to_role="architect",
+            summary="Ready",
+            branch="feat/daemon-lock",
+            pr_url=None,
+            commit=None,
+            skip_verify=False,
+            allow_unsynced=False,
+        )
+
+
+def test_foreground_daemon_allows_hard_mode_handoff(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    stub_git_context(monkeypatch, branch="feat/live-daemon", head="feed123")
+
+    collab.command_init(root)
+    collab.command_enable(
+        root,
+        actor="builder",
+        role="builder",
+        peer="architect",
+        enforcement_mode="hard",
+        install_hooks=False,
+    )
+    create_task(root, branch="feat/live-daemon")
+    collab.command_claim(root, task_id="TASK-001", actor="builder")
+    result = collab.daemon_sync_cycle(
+        root,
+        actor="builder",
+        role="builder",
+        run_mode="foreground",
+    )
+    daemon = result["daemon"]
+    monkeypatch.setattr(collab, "daemon_lock_is_held", lambda _root, role: role == "builder")
+    monkeypatch.setattr(collab, "daemon_pid_is_alive", lambda pid: pid == daemon["pid"])
+
+    result = collab.command_handoff(
+        root,
+        task_id="TASK-001",
+        actor="builder",
+        to_role="architect",
+        summary="Ready",
+        branch="feat/live-daemon",
+        pr_url=None,
+        commit=None,
+        skip_verify=False,
+        allow_unsynced=False,
+    )
+
+    assert result == 0

@@ -71,13 +71,41 @@ Do not use a corporate work address for commits in this org.
 ## Rules
 
 1. Send a message after every meaningful action (task claimed, PR opened, review done, task merged)
-2. Check for messages before starting new work and after completing work
-3. Use wait mode when idle — it returns instantly when a message arrives
-4. Keep messages short, single-line, and actionable — task IDs, PR numbers, what to do next
-5. Treat broker chat as ephemeral coordination, not source-of-truth state
+2. Send progress messages during real work too, not just at handoff time
+3. Check for messages before starting new work and after completing work
+4. Reply to direct status checks promptly so the peer does not mistake silence for drift
+5. Use wait mode when idle — it returns instantly when a message arrives
+6. Keep messages short, single-line, and actionable — task IDs, PR numbers, what to do next
+7. Treat broker chat as ephemeral coordination, not source-of-truth state
+8. `.collab/tasks/*.json` and PR state beat stale terminal output or old broker assumptions
 
 ## Task coordination
 
 Tasks still live in `.collab/tasks/` and are managed via `scripts/collab.py`. The broker handles real-time notifications between agents. Use both:
 - `scripts/collab.py` for task lifecycle (create, claim, handoff, review, complete)
-- The broker for instant "hey, your turn" signals and short live chat
+- The broker for instant "hey, your turn" signals, progress pings, and short live chat
+
+If this repo has enforced sync enabled, check the runtime before you start:
+
+```bash
+python3 scripts/collab.py doctor --role YOUR_ROLE
+python3 scripts/collab.py daemon status --role YOUR_ROLE
+```
+
+If the repo is using `--enforce hard`, keep
+`python3 scripts/collab.py daemon up --role YOUR_ROLE` running in a separate
+terminal while you work. `daemon once --role YOUR_ROLE` is only a manual
+refresh and does not satisfy hard mode. `handoff`, `review`, `complete`, and
+`pre-push` may block when the daemon heartbeat or Git context is stale.
+
+Minimum broker cadence for a real task:
+
+1. claim/start
+2. meaningful progress milestone
+3. verification green or blocked
+4. handoff
+5. merge/complete
+
+Prefer `recv --after-id ...` when resuming after an interruption. If approvals or
+sandbox rules are involved, keep command shapes stable and prefer the wrapper
+commands over raw `curl`.

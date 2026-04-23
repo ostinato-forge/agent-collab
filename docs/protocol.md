@@ -15,6 +15,7 @@ The user stays out of band and steps in only when needed.
 Use the broker as a real-time sidecar, not as the source of truth:
 
 - `.collab/tasks/*.json` remains authoritative
+- Git branch state and PR state are the contract boundary for actual shipped work
 - broker messages wake the peer up quickly
 - broker chat is for short live coordination only
 - important outcomes get promoted back into `.collab`
@@ -39,10 +40,18 @@ Security defaults:
 
 ## Canonical Files
 
-- `.collab/state.json`
-  Canonical machine-readable project state and queue summary.
 - `.collab/tasks/*.json`
-  One task per file. This is the main handoff artifact.
+  One task per file. This is the authoritative task state.
+- `.collab/state.json`
+  Derived machine-readable queue summary and freshness cache.
+- `.collab/runtime/active-role.txt`
+  Default runtime role for hook and daemon commands when no explicit `--role` is passed.
+- `.collab/runtime/<role>.json`
+  Repo-local runtime identity, peer role, enforcement mode, and daemon heartbeat for that role.
+- `.collab/runtime/<role>.daemon.lock`
+  Held only while that role's foreground daemon is actually running.
+- `.collab/runtime/hooks.json`
+  Installed Git hook manifest and chained backup metadata.
 - `.collab/inbox/architect.md`
   Short messages to the architect role.
 - `.collab/inbox/builder.md`
@@ -103,6 +112,85 @@ python3 scripts/collab.py sync --role builder --actor builder \
 ```
 
 State-changing `collab.py` commands also auto-record sync metadata now, so `new-task`, `claim`, `handoff`, `review`, `complete`, and `message` update the role checkpoint even if the agent forgets to run a separate `sync`.
+
+Role sync entries in `.collab/state.json` now track:
+
+- `last_sync_at`
+- `last_sync_by`
+- `last_sync_task_id`
+- `last_sync_branch`
+- `last_sync_head`
+- `last_sync_source`
+- `last_sync_reason`
+- `last_sync_note`
+- `last_inbox_mtime`
+
+## Enforced Sync Runtime
+
+When you want Git-aware sync enforcement instead of soft discipline alone, enable the runtime once per repo:
+
+```bash
+python3 scripts/collab.py enable \
+  --role builder --actor builder --peer architect --enforce warn
+python3 scripts/collab.py doctor --role builder
+python3 scripts/collab.py daemon up --role builder
+```
+
+What this does:
+
+- writes runtime identity to `.collab/runtime/<role>.json`
+- updates `.collab/runtime/active-role.txt`
+- installs repo-local Git hooks by default
+- records sync metadata that includes both branch and HEAD
+- lets `doctor` and `status` report runtime health
+
+Git hook behavior:
+
+- `post-checkout`, `post-commit`, `post-merge`, and `post-rewrite` refresh sync metadata
+- `pre-push` runs sync readiness checks
+
+Daemon behavior:
+
+- `daemon up --role <role>` runs in the foreground, keeps a heartbeat warm, and holds a role-scoped daemon lock
+- `daemon once --role <role>` is useful for one-shot refreshes and tests, but it does not satisfy hard mode
+- `daemon status` reports whether the heartbeat looks fresh
+
+Enforcement behavior:
+
+- in `warn` mode, readiness problems are reported but do not block
+- in `hard` mode, `handoff`, `review`, `complete`, and `pre-push` block when Git context or daemon freshness is out of date
+- `--allow-unsynced` exists for explicit emergency overrides and records that fact in task history and metadata
+
+## Live-Use Lessons
+
+The broker should be part of the real task loop, not just startup or final handoff.
+
+Recommended broker cadence:
+
+1. claim/start
+2. meaningful progress milestone
+3. verification green or blocked
+4. handoff
+5. merge/complete
+
+If the peer asks for status, answer immediately on the broker and then continue working.
+
+When multiple signals disagree:
+
+1. trust task files and PR state first
+2. treat `.collab/state.json` as derived summary
+3. treat broker history as ephemeral coordination history
+4. ignore stale terminal artifacts unless they match current task/PR state
+
+If a stale transcript or failed command creates the wrong story, fix it in both channels:
+
+- send a broker correction so the peer wakes up
+- write the durable correction into `.collab`
+
+If a roadmap pack has recurring review tracks such as security, UX/UI, or live validation,
+turn them into explicit collab tasks/checkpoints instead of leaving them implicit in plan text.
+
+For the fuller field notes, see [operational-lessons.md](operational-lessons.md).
 
 ## Workflow
 
@@ -218,6 +306,9 @@ These have clear file boundaries and strong acceptance criteria already.
 
 Core commands:
 - `python3 scripts/collab.py status`
+- `python3 scripts/collab.py enable --role architect --actor architect --peer builder --enforce warn`
+- `python3 scripts/collab.py doctor --role architect`
+- `python3 scripts/collab.py doctor --role builder`
 - `python3 scripts/collab.py sync --role architect --actor architect ...`
 - `python3 scripts/collab.py sync --role builder --actor builder ...`
 - `python3 scripts/collab.py next --role architect`
@@ -232,6 +323,10 @@ Core commands:
 - `python3 scripts/collab.py check-stale --actor architect`
 - `python3 scripts/collab.py watch --role architect --actor architect --interval 60`
 - `python3 scripts/collab.py watch --role builder --actor builder --interval 60`
+- `python3 scripts/collab.py daemon up --role architect`
+- `python3 scripts/collab.py daemon up --role builder`
+- `python3 scripts/collab.py daemon status --role architect`
+- `python3 scripts/collab.py daemon status --role builder`
 
 ## Intervention Points For The User
 

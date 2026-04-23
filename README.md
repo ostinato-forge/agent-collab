@@ -25,6 +25,16 @@ python3 scripts/collab.py init
 
 This creates `.collab/` with task files, inboxes, and state tracking. Add `.collab/` to your `.gitignore` — it's ephemeral session state, not production code.
 
+If you want enforced sync with Git hooks and daemon-backed freshness checks, enable the runtime once per repo:
+
+```bash
+python3 scripts/collab.py enable --role builder --actor builder --peer architect --enforce warn
+python3 scripts/collab.py doctor --role builder
+python3 scripts/collab.py daemon up --role builder
+```
+
+`enable` writes repo-local runtime identity under `.collab/runtime/`, one file per role, installs Git hooks by default, and records an initial sync checkpoint. `doctor` shows whether identity, hooks, daemon heartbeat, and sync readiness are healthy for the selected role.
+
 Start the secure real-time broker in a second terminal:
 
 ```bash
@@ -80,6 +90,9 @@ Architect                              Builder
 ```bash
 python3 scripts/collab.py init                          # create .collab/ workspace
 python3 scripts/collab.py status                        # queue summary
+python3 scripts/collab.py enable \                      # install runtime identity + hooks
+  --role builder --actor builder --peer architect --enforce warn
+python3 scripts/collab.py doctor --role builder         # inspect runtime identity + sync health
 python3 scripts/collab.py sync --role builder \         # checkpoint + delta summary
   --actor builder --note "starting work"
 python3 scripts/collab.py next --role builder            # show queued tasks for a role
@@ -101,6 +114,9 @@ python3 scripts/collab.py message --to architect \       # async messages
   --from-actor builder --subject "question" --body "..."
 python3 scripts/collab.py watch --role builder \         # background watcher + heartbeat
   --actor builder --interval 60 --note "watching queue" --check-stale
+python3 scripts/collab.py daemon up --role builder      # foreground sync daemon
+python3 scripts/collab.py daemon once --role builder    # manual refresh, not enough for hard mode
+python3 scripts/collab.py daemon status --role builder  # daemon heartbeat and freshness
 ```
 
 ## Real-Time Broker
@@ -137,11 +153,29 @@ Recommended split:
 - use `after_id` when reconnecting after an interruption so you do not replay stale messages
 - promote any important chat decision back into `.collab` via `handoff`, `review`, `complete`, or `message`
 
+## Operational Lessons
+
+Live use changed the protocol in a few important ways:
+
+- `.collab/tasks/*.json` is the source of truth; `.collab/state.json` is a derived summary, not the deciding layer
+- the broker has to be used during real work, not just at startup and handoff
+- good broker cadence is: claim, progress, verification, blocked, handoff, merge
+- if stale output creates a false picture, correct it with both a broker wakeup and a durable `.collab` note
+- recurring review tracks such as security, UX/UI, and live validation should become explicit collab checkpoints
+
+See [docs/operational-lessons.md](docs/operational-lessons.md) for the field notes from live use.
+
 ## Coordination Files
 
 ```
 .collab/
   state.json              # machine-readable session state and queue summary
+  runtime/
+    active-role.txt       # default role for hook and daemon commands
+    architect.json        # architect runtime identity, policy, and daemon state
+    builder.json          # builder runtime identity, policy, and daemon state
+    builder.daemon.lock   # held while the builder foreground daemon is running
+    hooks.json            # installed hook manifest and chained backups
   tasks/
     TASK-001.json          # individual task with full lifecycle history
     TASK-002.json
@@ -152,11 +186,17 @@ Recommended split:
     TASK-001-*.md           # persisted review decisions with findings
 ```
 
-`state.json` role entries now also track the last explicit sync checkpoint:
+`state.json` is a derived queue/freshness summary. It is useful for dashboards and
+watchers, but task files and PR state remain authoritative.
+
+`state.json` role entries also track the last explicit sync checkpoint:
 - `last_sync_at`
 - `last_sync_by`
 - `last_sync_task_id`
 - `last_sync_branch`
+- `last_sync_head`
+- `last_sync_source`
+- `last_sync_reason`
 - `last_sync_note`
 - `last_inbox_mtime`
 
@@ -191,6 +231,9 @@ Recommended pattern for each agent:
 
 - run `python3 brokerctl.py onboard --role <role>` once at session start or paste its output into the other agent
 - run `python3 scripts/collab.py watch --role <role> --actor <role> --interval 60` in the background
+- run `python3 scripts/collab.py enable --role <role> --actor <role> --peer <other-role> --enforce warn` once when you want Git hooks and runtime enforcement
+- run `python3 scripts/collab.py doctor --role <role>` before starting work in an enforced repo
+- run `python3 scripts/collab.py daemon up --role <role>` in a dedicated terminal when the repo is using enforced sync
 - run `python3 brokerctl.py up` once per machine/session in a dedicated terminal
 - run `python3 brokerctl.py recv --role <role> --wait 60` when you are idle and waiting for the next handoff
 - run `python3 brokerctl.py chat --role <role> --peer <other-role>` when you need live back-and-forth
@@ -210,6 +253,15 @@ Add `--check-stale` to `sync` or `watch` when you want stale `in_progress` / `in
 
 State-changing `collab.py` commands also auto-record sync metadata now, so silence is less likely to look like a stall.
 
+When runtime enforcement is enabled:
+
+- repo-local Git hooks refresh sync checkpoints after `checkout`, `commit`, `merge`, and rewrite events
+- `pre-push` runs the same sync readiness check used by lifecycle commands
+- `daemon up --role <role>` is the enforcement daemon and holds a role-scoped lock while it runs
+- `daemon once --role <role>` is only a manual refresh
+- `handoff`, `review`, and `complete` can block in `hard` mode if the daemon heartbeat or Git context is stale
+- `--allow-unsynced` exists as an explicit escape hatch and leaves a trace in task history
+
 ## Agent Runtime Notes
 
 - `AGENT.md` is the short operational brief for the active architect/builder session.
@@ -225,6 +277,7 @@ A companion skill at `~/.claude/skills/collab/` provides Claude Code with struct
 ## Full Protocol Reference
 
 See [docs/protocol.md](docs/protocol.md) for the complete workflow, examples, and intervention points.
+See [docs/operational-lessons.md](docs/operational-lessons.md) for the live-use lessons and operating rules.
 
 ## Tested With
 
