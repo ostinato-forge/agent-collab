@@ -90,6 +90,7 @@ What helped in practice:
 - queue/status views that surface branch, PR URL, commit, and last actor
 - broker progress signals between claim and handoff
 - explicit replies to broker status checks
+- a one-shot session bootstrap that verifies the broker, records a sync checkpoint, and starts the repo daemon before the agent settles into idle waiting
 
 Recommended sync moments:
 
@@ -102,6 +103,14 @@ Recommended sync moments:
 
 Prefer `after_id` when resuming broker listeners. It is more reliable than
 ad hoc timestamp filters when a session is interrupted or clocks/formatting get weird.
+
+Passive onboarding text is not enough when an agent session starts cold. The protocol works better when startup itself actively proves liveness across both layers:
+
+- broker reachable
+- repo `.collab` state initialized
+- runtime identity present
+- session sync checkpoint recorded
+- daemon heartbeat healthy
 
 Two concrete protocol bugs showed up in live use:
 

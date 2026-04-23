@@ -14,9 +14,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
-from typing import Any
+import time
+from typing import Any, NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -27,6 +29,14 @@ DEFAULT_PORT = 9111
 DEFAULT_TOKEN_FILE = Path(f"/tmp/agent-collab-broker-token-{os.getuid()}")
 VALID_KINDS = ("signal", "chat")
 BROKER_MODULE_PATH = Path(__file__).resolve().with_name("broker.py")
+ENFORCEMENT_MODES = ("off", "warn", "hard")
+SESSION_BOOT_TIMEOUT_SECONDS = 5.0
+
+
+class DaemonLaunchResult(NamedTuple):
+    action: str
+    log_path: Path
+    pid: int | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,6 +61,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     onboard.add_argument("--role", required=True)
     onboard.add_argument("--peer")
+
+    start_session = subparsers.add_parser(
+        "start-session",
+        help="Bootstrap a repo session: warm sync state and ensure the collab daemon is live.",
+    )
+    start_session.add_argument("--role", required=True)
+    start_session.add_argument("--repo", default=".")
+    start_session.add_argument("--actor")
+    start_session.add_argument("--peer")
+    start_session.add_argument(
+        "--enforce",
+        default="warn",
+        choices=ENFORCEMENT_MODES,
+        help="Enforcement mode to use only when runtime identity needs to be created.",
+    )
+    start_session.add_argument(
+        "--note",
+        default="session start",
+        help="Sync note to record for the session bootstrap checkpoint.",
+    )
+    start_session.add_argument(
+        "--daemon-interval",
+        type=int,
+        default=15,
+        help="Polling interval for the repo sync daemon when one must be launched.",
+    )
+    start_session.add_argument(
+        "--daemon-log",
+        help="Optional path for the detached daemon log. Defaults to <repo>/.collab/<role>-daemon.log.",
+    )
+    start_session.add_argument(
+        "--collab-script",
+        help="Optional path to the repo-local collab.py. Defaults to <repo>/scripts/collab.py.",
+    )
+    start_session.add_argument(
+        "--no-daemon",
+        action="store_true",
+        help="Skip daemon startup and only warm the repo state.",
+    )
 
     subparsers.add_parser("status", help="Show broker queue status.")
 
@@ -105,6 +154,8 @@ def main() -> int:
     try:
         if args.command == "status":
             payload = _get_json(f"{base_url}/status", token=token)
+        elif args.command == "start-session":
+            return command_start_session(args, base_url=base_url, token=token)
         elif args.command == "recv":
             payload = _get_json(
                 f"{base_url}/recv?{urlencode(recv_query_params(args))}",
@@ -229,6 +280,9 @@ def command_onboard(args: argparse.Namespace) -> int:
     print(f"chat channel: {channel}")
     print("source of truth: .collab/tasks/*.json")
     print("")
+    print("Fast path:")
+    print(f"  python3 brokerctl.py start-session --role {args.role} --repo /path/to/repo")
+    print("")
     print("Start here:")
     print("  python3 brokerctl.py status")
     print(f"  python3 brokerctl.py recv --role {args.role} --wait 60")
@@ -244,6 +298,113 @@ def command_onboard(args: argparse.Namespace) -> int:
     print("  - use chat for short coordination only")
     print("  - record real handoffs/reviews in scripts/collab.py")
     print("  - keep broker messages single-line and actionable")
+    return 0
+
+
+def command_start_session(
+    args: argparse.Namespace,
+    *,
+    base_url: str,
+    token: str | None,
+) -> int:
+    repo = Path(args.repo).expanduser().resolve()
+    if not repo.exists():
+        raise RuntimeError(f"repo does not exist: {repo}")
+    if not repo.is_dir():
+        raise RuntimeError(f"repo is not a directory: {repo}")
+
+    collab_script = resolve_collab_script(repo, explicit_path=args.collab_script)
+    existing_runtime = load_runtime_config(repo, args.role)
+    actor = args.actor or str((existing_runtime or {}).get("actor") or args.role)
+    peer = str((existing_runtime or {}).get("peer") or default_peer_for(args.role, args.peer))
+    if args.peer:
+        peer = args.peer
+    broker_status = _get_json(f"{base_url}/status", token=token)
+
+    init_result = run_collab_command(repo, collab_script, ["init"])
+    set_active_runtime_role(repo, args.role)
+    runtime_exists = existing_runtime is not None
+    enable_result: subprocess.CompletedProcess[str] | None = None
+    if not runtime_exists:
+        enable_result = run_collab_command(
+            repo,
+            collab_script,
+            [
+                "enable",
+                "--role",
+                args.role,
+                "--actor",
+                actor,
+                "--peer",
+                peer,
+                "--enforce",
+                args.enforce,
+            ],
+        )
+
+    sync_result = run_collab_command(
+        repo,
+        collab_script,
+        ["sync", "--role", args.role, "--actor", actor, "--note", args.note],
+    )
+    next_result = run_collab_command(repo, collab_script, ["next", "--role", args.role])
+
+    daemon_result: DaemonLaunchResult | None = None
+    if not args.no_daemon:
+        daemon_log_path = resolve_daemon_log_path(repo, role=args.role, explicit_path=args.daemon_log)
+        daemon_result = ensure_daemon_running(
+            repo,
+            collab_script,
+            role=args.role,
+            interval=args.daemon_interval,
+            log_path=daemon_log_path,
+        )
+
+    doctor_result: subprocess.CompletedProcess[str] | None = None
+    if not args.no_daemon:
+        doctor_result = run_collab_command(
+            repo,
+            collab_script,
+            ["doctor", "--role", args.role],
+            check=False,
+        )
+
+    print("Agent-collab session started")
+    print(f"role: {args.role}")
+    print(f"actor: {actor}")
+    print(f"peer: {peer}")
+    print(f"repo: {repo}")
+    print(f"collab script: {collab_script}")
+    pending_messages = broker_status.get("total", broker_status.get("message_count", "?"))
+    print(
+        f"broker: {base_url} [ok, pending_messages={pending_messages}]"
+    )
+    print_command_block("init", init_result.stdout)
+    if enable_result is None:
+        print("runtime: already enabled")
+    else:
+        print_command_block("runtime", enable_result.stdout)
+    print_command_block("sync", sync_result.stdout)
+    print_command_block("queue", next_result.stdout)
+    if daemon_result is None:
+        print("daemon: skipped (--no-daemon)")
+    else:
+        if daemon_result.action == "already running":
+            print(f"daemon: already running [{daemon_result.log_path}]")
+        else:
+            print(
+                f"daemon: started pid={daemon_result.pid} interval={args.daemon_interval}s [{daemon_result.log_path}]"
+            )
+    if doctor_result is not None:
+        if doctor_result.returncode == 0:
+            print_command_block("doctor", doctor_result.stdout)
+        else:
+            print_command_block("doctor (warnings)", command_output(doctor_result))
+    else:
+        print("doctor: skipped (daemon bootstrap disabled)")
+    print("next:")
+    print(f"  python3 brokerctl.py recv --role {args.role} --wait 60")
+    print(f"  python3 brokerctl.py chat --role {args.role} --peer {peer}")
     return 0
 
 
@@ -380,6 +541,169 @@ def load_broker_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def resolve_collab_script(repo: Path, *, explicit_path: str | None = None) -> Path:
+    candidate = Path(explicit_path).expanduser() if explicit_path else repo / "scripts" / "collab.py"
+    if not candidate.is_absolute():
+        candidate = (repo / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    if not candidate.exists():
+        raise RuntimeError(f"collab.py not found: {candidate}")
+    return candidate
+
+
+def runtime_config_path(repo: Path, role: str) -> Path:
+    return repo / ".collab" / "runtime" / f"{role}.json"
+
+
+def active_runtime_role_path(repo: Path) -> Path:
+    return repo / ".collab" / "runtime" / "active-role.txt"
+
+
+def load_runtime_config(repo: Path, role: str) -> dict[str, object] | None:
+    path = runtime_config_path(repo, role)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid runtime config: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"invalid runtime config payload: {path}")
+    return payload
+
+
+def set_active_runtime_role(repo: Path, role: str) -> None:
+    path = active_runtime_role_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{role}\n", encoding="utf-8")
+
+
+def resolve_daemon_log_path(repo: Path, *, role: str, explicit_path: str | None = None) -> Path:
+    if explicit_path:
+        candidate = Path(explicit_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = (repo / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        return candidate
+    return repo / ".collab" / f"{role}-daemon.log"
+
+
+def print_command_block(title: str, output: str) -> None:
+    print(f"{title}:")
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        print("  (no output)")
+        return
+    for line in lines:
+        print(f"  {line}")
+
+
+def command_output(result: subprocess.CompletedProcess[str]) -> str:
+    parts = [part.strip() for part in (result.stdout, result.stderr) if part and part.strip()]
+    return "\n".join(parts)
+
+
+def run_collab_command(
+    repo: Path,
+    collab_script: Path,
+    argv: list[str],
+    *,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [sys.executable, str(collab_script), *argv],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        detail = command_output(result)
+        if detail:
+            raise RuntimeError(
+                f"collab command failed in {repo}: {' '.join(argv)}\n{detail}"
+            )
+        raise RuntimeError(
+            f"collab command failed in {repo}: {' '.join(argv)} (exit {result.returncode})"
+        )
+    return result
+
+
+def ensure_daemon_running(
+    repo: Path,
+    collab_script: Path,
+    *,
+    role: str,
+    interval: int,
+    log_path: Path,
+) -> DaemonLaunchResult:
+    status_result = run_collab_command(
+        repo,
+        collab_script,
+        ["daemon", "--role", role, "status"],
+        check=False,
+    )
+    if status_result.returncode == 0:
+        return DaemonLaunchResult(action="already running", log_path=log_path)
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as handle:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(collab_script),
+                "daemon",
+                "--role",
+                role,
+                "up",
+                "--interval",
+                str(interval),
+            ],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    deadline = time.monotonic() + SESSION_BOOT_TIMEOUT_SECONDS
+    last_status = command_output(status_result)
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        status_result = run_collab_command(
+            repo,
+            collab_script,
+            ["daemon", "--role", role, "status"],
+            check=False,
+        )
+        last_status = command_output(status_result)
+        if status_result.returncode == 0:
+            return DaemonLaunchResult(
+                action="started",
+                log_path=log_path,
+                pid=process.pid,
+            )
+        if process.poll() is not None:
+            break
+
+    log_excerpt = read_log_excerpt(log_path)
+    detail = last_status or "daemon status stayed unhealthy during bootstrap"
+    if log_excerpt:
+        detail = f"{detail}\nlog excerpt:\n{log_excerpt}"
+    raise RuntimeError(f"daemon failed to become healthy for {role}\n{detail}")
+
+
+def read_log_excerpt(path: Path, *, max_chars: int = 600) -> str:
+    if not path.exists():
+        return ""
+    raw = path.read_text(encoding="utf-8", errors="replace").strip()
+    if len(raw) <= max_chars:
+        return raw
+    return raw[-max_chars:]
 
 
 def resolve_token(explicit: str | None, token_file: str | None) -> str | None:

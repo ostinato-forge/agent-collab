@@ -25,6 +25,7 @@ Simple onboarding:
 ```bash
 python3 brokerctl.py up
 python3 brokerctl.py onboard --role builder
+python3 brokerctl.py start-session --role builder --repo /path/to/your-repo
 python3 brokerctl.py recv --role builder --wait 60
 python3 brokerctl.py chat --role builder --peer architect
 ```
@@ -102,6 +103,14 @@ Recommended checkpoint moments:
 - the peer role's last sync freshness
 
 `watch --actor ...` keeps a lightweight heartbeat warm in the background while still printing queue changes.
+
+When a session feels stale at startup, use the active bootstrap instead of relying on manual sequencing:
+
+```bash
+python3 brokerctl.py start-session --role builder --repo /path/to/your-repo
+```
+
+That command verifies the broker, initializes `.collab` if needed, enables repo runtime identity when missing, records a session sync, shows the current queue, and makes sure the role daemon is healthy before it reports success.
 
 Use `--check-stale` on `sync` or `watch` when you want the CLI to flag long-idle `in_progress` / `in_review` tasks and notify the architect inbox without forcing a status change:
 

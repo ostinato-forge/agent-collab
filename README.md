@@ -48,6 +48,7 @@ Prefer the local wrapper instead of raw `curl` when driving agents from a restri
 
 ```bash
 python3 brokerctl.py onboard --role builder
+python3 brokerctl.py start-session --role builder --repo /path/to/your-repo
 python3 brokerctl.py status
 python3 brokerctl.py recv --role builder --wait 60
 python3 brokerctl.py send --to architect --from-role builder --body "TASK-001 ready for review PR #123"
@@ -125,6 +126,8 @@ Use the broker alongside `scripts/collab.py` when you want low-latency coordinat
 
 ```bash
 python3 brokerctl.py onboard --role builder                  # one-screen agent quickstart
+python3 brokerctl.py start-session --role builder --repo /path/to/your-repo
+                                                            # active bootstrap: init/enable/sync/next/daemon/doctor
 python3 brokerctl.py up                                            # start secure broker
 python3 brokerctl.py status                                        # queue depth / role summary
 python3 brokerctl.py recv --role builder                           # check messages
@@ -230,6 +233,7 @@ Use both layers together:
 Recommended pattern for each agent:
 
 - run `python3 brokerctl.py onboard --role <role>` once at session start or paste its output into the other agent
+- run `python3 brokerctl.py start-session --role <role> --repo <repo>` when you want one command to warm `.collab`, record a session sync, and ensure the repo daemon is alive
 - run `python3 scripts/collab.py watch --role <role> --actor <role> --interval 60` in the background
 - run `python3 scripts/collab.py enable --role <role> --actor <role> --peer <other-role> --enforce warn` once when you want Git hooks and runtime enforcement
 - run `python3 scripts/collab.py doctor --role <role>` before starting work in an enforced repo
