@@ -1,5 +1,7 @@
 # agent-collab
 
+> **Status:** The protocol, the broker, and the CLI work, and the 44 tests pass from a fresh clone. Built and used on one private product in spring 2026; the architect and builder split it demonstrates moved into a larger private studio. Stable; not under active development.
+
 Repo-local async collaboration protocol for autonomous multi-agent coding workflows.
 
 Two AI coding agents coordinate through two layers:
