@@ -290,4 +290,4 @@ See [docs/operational-lessons.md](docs/operational-lessons.md) for the live-use 
 ## Tested With
 
 - Claude Code (architect) + Codex (builder)
-- Used on [example-org/example-repo](https://github.com/example-org/example-repo) — 14 tasks across 2 roadmap packs completed through the protocol
+- Used on one private product: 14 tasks across 2 roadmap packs completed through the protocol
