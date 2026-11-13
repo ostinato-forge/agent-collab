@@ -1,16 +1,93 @@
 # agent-collab
 
-> **Status:** The protocol, the broker, and the CLI work, and the 44 tests pass from a fresh clone. Built and used on one private product in spring 2026; the architect and builder split it demonstrates moved into a larger private studio. Stable; not under active development.
+Coordinate Claude and Codex through a local authenticated broker. Send messages
+while both agents work, track explicit responses, and nudge sessions that stop
+responding. Keep task ownership, handoffs, and review history in repo-local files.
 
-Repo-local async collaboration protocol for autonomous multi-agent coding workflows.
+The operator can join the conversation through terminal chat. Messages retain
+sender labels. Automated nudges do not impersonate the operator or grant new
+permission to act.
 
-Two AI coding agents coordinate through two layers:
-- `.collab/` files for durable task state, inboxes, and review history
-- a lightweight local broker for real-time "your turn" signals
+## What it does
 
-One agent architects (plans tasks, reviews PRs), one builds (implements, creates PRs). Git branches and GitHub PRs are the contract boundary. The human stays out-of-band as tech lead, stepping in only when needed.
+- Streams messages into one persistent `claude -p` session.
+- Queues replies into an existing Codex thread.
+- Tracks `queued`, `acknowledged`, `working`, `answered`, `failed`, and `timed_out`.
+- Sends bounded nudges after missed acknowledgement or progress deadlines.
+- Alerts the sender when a request fails or exhausts its nudge budget.
+- Keeps task claims, handoffs, reviews, and Git checks in `.collab/`.
 
-## Quick Start
+The broker uses blocking long polling. No model calls are made just to check
+for messages. Queue acceptance is separate from an explicit model response.
+
+## Start live agent chat
+
+Requirements: Python 3.11 or later, plus installed and authenticated Claude and
+Codex CLIs for their respective adapters. The Python tools use the standard
+library. Run these commands from this repository, each in its own terminal.
+
+Start the broker:
+
+```bash
+python3 brokerctl.py up
+```
+
+Start the Claude builder in the project checkout:
+
+```bash
+python3 agentchat.py claude \
+  --role builder --peer architect --channel dm:architect:builder \
+  --repo /absolute/path/to/project --model claude-opus-5-5
+```
+
+Claude starts with no tools. For implementation work, explicitly add the needed
+allowlist, such as `--tools 'Read,Glob,Grep,Edit,Write'`. Normal permission checks
+still apply. Model use can consume your account's paid usage.
+
+Connect an existing Codex thread:
+
+```bash
+python3 codexbridge.py \
+  --thread YOUR_CODEX_THREAD_ID --repo /absolute/path/to/project \
+  --channel dm:architect:builder --nudge-resume
+```
+
+`--nudge-resume` requests a Codex resume only for an automated nudge. It is best
+effort. A queue receipt does not prove that the session woke or read the message.
+Omit the flag to queue messages without requesting a resume.
+
+Wait for both adapters to report that they are listening. Then send a tracked
+request from another terminal:
+
+```bash
+python3 brokerctl.py send \
+  --to builder --from-role architect --kind chat \
+  --channel dm:architect:builder --body 'Inspect the task brief and report your next step.' \
+  --require-response --ack-timeout 30 --progress-timeout 120 --max-nudges 2
+
+python3 brokerctl.py responses --channel dm:architect:builder
+```
+
+The recipient must explicitly acknowledge the original message ID. Fresh
+progress renews the progress deadline. Duplicate or unrelated output does not.
+Nudges have a fixed lifetime budget; progress does not replenish it. A final
+answer, failure, or timeout closes the tracked request.
+
+To watch and participate:
+
+```bash
+python3 brokerctl.py chat --role architect --peer builder
+```
+
+This example shares the architect role with the coordinator. Role names are
+labels, not separate authenticated identities. Only requests sent with
+`--require-response` are monitored; ordinary terminal chat remains untracked.
+
+See [live chat setup and recovery](docs/live-agent-chat.md) and
+[response monitoring](docs/response-monitoring.md) for explicit response commands,
+limits, and failure behavior.
+
+## Task workflow setup
 
 Copy `collab.py` into your project's `scripts/` directory:
 
@@ -25,7 +102,7 @@ cd /path/to/your-repo
 python3 scripts/collab.py init
 ```
 
-This creates `.collab/` with task files, inboxes, and state tracking. Add `.collab/` to your `.gitignore` — it's ephemeral session state, not production code.
+This creates `.collab/` with task files, inboxes, and state tracking. Add `.collab/` to your `.gitignore`. It holds local coordination state, not production code.
 
 If you want enforced sync with Git hooks and daemon-backed freshness checks, enable the runtime once per repo:
 
@@ -61,19 +138,25 @@ python3 brokerctl.py chat --role builder --peer architect
 token file under `/tmp` so other local agents can connect without re-copying secrets
 by hand.
 
-## Live Claude and Codex sessions
+## Operating limits
 
-Connect the broker to a persistent `claude -p` process and an existing Codex
-thread. The adapters use blocking long polling, stream messages into Claude,
-and queue Claude replies for Codex without starting a second coordinator.
-See [Live agent chat](docs/live-agent-chat.md) for setup, delivery states,
-permissions, and recovery. No A2A server or new Python dependency is needed.
-Use [response monitoring](docs/response-monitoring.md) when a message needs an
-explicit acknowledgement, progress updates, and bounded nudges.
+The broker binds to loopback and uses a shared token. Use a separate broker
+port and token for unrelated projects. Broker messages and response tracking
+are in memory and are lost on restart. Keep decisions and acceptance evidence
+in task records or Git. A reset changes the conversation generation so stale
+responses cannot affect a new conversation.
+
+Both adapters skip existing chat when they start. Start them before sending
+work. They have message and runtime limits, and stop on detected connection
+or delivery failures. Review uncertain deliveries before resending them.
+
+Claude child failures are observed directly. Codex queue failures are observed,
+but the adapter does not own the existing Codex process. Missing model responses
+are detected by deadlines. Neither adapter guarantees immediate model attention.
 
 ## Commit Identity Hygiene
 
-When this protocol is used inside `netauto-labs`, commits should resolve to the
+When this protocol is used inside `ostinato-forge`, commits should resolve to the
 approved GitHub-linked personal address for the org rather than a corporate work
 address. Check `git config user.email` before committing, and prefer an org-specific
 Git include so the safe identity is applied automatically by remote URL.
@@ -231,7 +314,7 @@ proposed → in_progress → in_review → approved → done
 
 1. One task, one branch, one current owner role.
 2. The builder does not start work without claiming a task.
-3. The architect does not review vague work — the builder hands off with a concrete summary, branch, and PR link.
+3. The architect requires a clear handoff. The builder hands off with a concrete summary, branch, and PR link.
 4. Two agents should not edit the same file set in parallel unless the human explicitly wants that risk.
 5. If review loops do not converge after two rounds, mark the task blocked and escalate to the human.
 
@@ -290,7 +373,7 @@ If you are driving an agent directly, point it at `AGENT.md` first so it sees th
 
 ## Integration with Claude Code
 
-A companion skill at `~/.claude/skills/collab/` provides Claude Code with structured architect/builder workflows on top of this CLI. The skill is optional — agents can follow `AGENT.md` and `docs/protocol.md` directly.
+A companion skill at `~/.claude/skills/collab/` provides Claude Code with structured architect/builder workflows on top of this CLI. The skill is optional. Agents can follow `AGENT.md` and `docs/protocol.md` directly.
 
 ## Full Protocol Reference
 
@@ -301,3 +384,11 @@ See [docs/operational-lessons.md](docs/operational-lessons.md) for the live-use 
 
 - Claude Code (architect) + Codex (builder)
 - Used on one private product: 14 tasks across 2 roadmap packs completed through the protocol
+
+## Validation
+
+The integrated branch passes 157 local tests. Live Opus 5.5 checks confirmed
+streamed input, replies queued to Codex, and explicit acknowledgement, progress,
+and answer states. A silent-recipient check confirmed the configured nudge
+limit and timeout alert. Independent code and security review found no blocking
+issues. CI runs on Linux and macOS; Windows is not currently in the matrix.
