@@ -130,6 +130,22 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--kind", choices=VALID_KINDS, default="signal")
     send.add_argument("--channel")
 
+    send.add_argument("--require-response", action="store_true",
+                      help="track acknowledgement and progress deadlines for this chat")
+    send.add_argument("--ack-timeout", type=int)
+    send.add_argument("--progress-timeout", type=int)
+    send.add_argument("--max-nudges", type=int)
+
+    responses = subparsers.add_parser("responses", help="Show tracked response states")
+    responses.add_argument("--channel")
+    respond = subparsers.add_parser("respond", help="Record an explicit response to a message")
+    respond.add_argument("--message-id", type=int, required=True)
+    respond.add_argument("--generation", required=True)
+    respond.add_argument("--actor", required=True)
+    respond.add_argument("--state", required=True,
+                         choices=("acknowledged", "working", "answered", "failed"))
+    respond.add_argument("--detail", default="")
+
     chat = subparsers.add_parser("chat", help="Open a live terminal chat with a peer.")
     chat.add_argument("--role", required=True)
     chat.add_argument("--peer", required=True)
@@ -142,6 +158,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.command == "send":
+        configured = any(value is not None for value in
+                         (args.ack_timeout, args.progress_timeout, args.max_nudges))
+        if configured and not args.require_response:
+            parser.error("response deadlines require --require-response")
+        if args.require_response:
+            if args.kind != "chat" or not args.channel or args.to == args.from_role:
+                parser.error("--require-response needs chat, a channel, and distinct roles")
+            for name in ("ack_timeout", "progress_timeout"):
+                value = getattr(args, name)
+                if value is not None and not 1 <= value <= 3600:
+                    parser.error(name.replace("_", "-") + " must be 1 to 3600 seconds")
+            if args.max_nudges is not None and not 0 <= args.max_nudges <= 5:
+                parser.error("max-nudges must be 0 to 5")
+    if args.command == "respond" and (args.message_id < 1 or not args.generation.strip()):
+        parser.error("respond requires a positive message ID and a generation")
 
     if args.command == "up":
         return command_up(args)
@@ -167,17 +200,33 @@ def main() -> int:
                 token=token,
             )
         elif args.command == "send":
-            payload = _post_json(
-                f"{base_url}/send",
-                {
-                    "to": args.to,
-                    "from": args.from_role,
-                    "body": args.body,
-                    "kind": args.kind,
-                    "channel": args.channel,
-                },
-                token=token,
-            )
+            request: dict[str, object] = {
+                "to": args.to, "from": args.from_role, "body": args.body,
+                "kind": args.kind, "channel": args.channel,
+            }
+            if args.require_response:
+                support = _get_json(f"{base_url}/responses", token=token)
+                generation = support.get("generation")
+                if (not isinstance(generation, str) or not generation
+                        or not isinstance(support.get("responses"), list)):
+                    raise RuntimeError("broker does not support response monitoring; update and restart it")
+                request["generation"] = generation
+                request["response"] = {
+                    "ack_timeout": args.ack_timeout if args.ack_timeout is not None else 30,
+                    "progress_timeout": args.progress_timeout if args.progress_timeout is not None else 120,
+                    "max_nudges": args.max_nudges if args.max_nudges is not None else 2,
+                }
+            payload = _post_json(f"{base_url}/send", request, token=token)
+            if args.require_response and payload.get("response_required") is not True:
+                raise RuntimeError("broker did not confirm response tracking; delivery is uncertain, do not retry automatically")
+        elif args.command == "responses":
+            query = urlencode({"channel": args.channel}) if args.channel else ""
+            payload = _get_json(f"{base_url}/responses?{query}", token=token)
+        elif args.command == "respond":
+            payload = _post_json(f"{base_url}/response", {
+                "message_id": args.message_id, "generation": args.generation,
+                "actor": args.actor, "state": args.state, "detail": args.detail,
+            }, token=token)
         elif args.command == "chat":
             return command_chat(args, base_url=base_url, token=token)
         else:

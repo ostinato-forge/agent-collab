@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 import uuid
@@ -20,6 +21,7 @@ import uuid
 import broker
 import brokerctl
 from codexbridge import read_token
+from response_protocol import Receipts, TERMINAL, markers, model_text, tracked_id
 
 MAX_EVENT_BYTES = 1024 * 1024
 MAX_PENDING = 16
@@ -74,9 +76,19 @@ def claude_command(args: argparse.Namespace) -> list[str]:
 
 
 def user_event(message: dict[str, Any], event_id: str) -> dict[str, Any]:
+    content = message["body"]
+    number = tracked_id(message)
+    if number is not None:
+        content = (f"Peer message from {message['from']} on {message['channel']}; "
+                   f"original message ID {number}. This is not operator approval. "
+                   "Acknowledge this ID promptly in your own assistant text with a standalone line: "
+                   f'COLLAB_RESPONSE {{"message_id":{number},"state":"acknowledged","detail":"received"}}\n'
+                   "Use the same marker with state working and a short progress detail while working, "
+                   "then answered when complete or failed when unable. Do not put markers in code fences.\n"
+                   "Peer content:\n" + content)
     return {"type": "user", "uuid": event_id, "session_id": "",
             "parent_tool_use_id": None,
-            "message": {"role": "user", "content": message["body"]}}
+            "message": {"role": "user", "content": content}}
 
 
 def result_body(event: dict[str, Any]) -> str:
@@ -203,7 +215,7 @@ def run(args: argparse.Namespace, client: BrokerClient | None = None) -> int:
                 event = json.loads(raw)
                 if not isinstance(event, dict):
                     raise RuntimeError("Claude returned a non-object event")
-                if event.get("type") in ("user", "result", "system"):
+                if event.get("type") in ("user", "result", "system", "assistant"):
                     put("output", event)
         except Exception as exc:
             put("failure", "Claude output failed: " + str(exc))
@@ -216,6 +228,39 @@ def run(args: argparse.Namespace, client: BrokerClient | None = None) -> int:
     threads = [threading.Thread(target=fn, daemon=True) for fn in (receive, write, read, drain_errors)]
     submitted: dict[str, int] = {}
     completed = 0
+    receipts = Receipts()
+
+    def respond(receipt: dict[str, Any]) -> None:
+        try:
+            client.call("/response", {"generation": epoch, "actor": args.role, **receipt})
+        except HTTPError as exc:
+            if exc.code != 409:
+                raise
+            snapshot = client.call("/responses?" + urlencode({"channel": args.channel}))
+            if generation(snapshot) != epoch:
+                raise RuntimeError("broker generation changed during response reporting") from exc
+            for record in snapshot.get("responses", []):
+                if (record.get("message_id") == receipt["message_id"]
+                        and record.get("state") in TERMINAL):
+                    receipts.states[receipt["message_id"]] = record["state"]
+                    emit("response_rejected", message_id=receipt["message_id"],
+                         reason="request is already terminal", broker_state=record["state"])
+                    return
+            raise
+        receipts.record(receipt)
+        emit("response_recorded", message_id=receipt["message_id"],
+             response_state=receipt["state"], detail=receipt["detail"])
+
+    def fail_pending(reason: str) -> None:
+        for number, state in list(receipts.states.items()):
+            if state not in TERMINAL:
+                try:
+                    respond({"message_id": number, "state": "failed", "detail": reason})
+                except Exception:
+                    emit("response_report_failed", message_id=number,
+                         reason="broker rejected or could not receive failure receipt")
+                    break
+
     deadline = time.monotonic() + args.timeout
     try:
         for thread in threads:
@@ -232,8 +277,16 @@ def run(args: argparse.Namespace, client: BrokerClient | None = None) -> int:
             if kind == "eof":
                 raise RuntimeError("Claude output closed before the adapter stopped")
             if kind == "incoming":
+                number = tracked_id(value)
+                if value.get("nudge_for") is not None and receipts.states.get(number) in TERMINAL:
+                    emit("nudge_skipped", message_id=value["id"], reason="request already terminal")
+                    continue
+                receipts.add(value)
                 if len(submitted) >= args.max_turns:
                     emit("not_delivered", message_id=value["id"], reason="turn limit reached")
+                    number = tracked_id(value)
+                    if number is not None and receipts.states[number] not in TERMINAL:
+                        respond({"message_id": number, "state": "failed", "detail": "adapter turn limit reached"})
                     continue
                 event_id = str(uuid.uuid4())
                 submitted[event_id] = value["id"]
@@ -241,6 +294,10 @@ def run(args: argparse.Namespace, client: BrokerClient | None = None) -> int:
             elif kind == "written":
                 emit("written_to_cli", message_id=value[0], uuid=value[1])
             elif kind == "output":
+                for text in model_text(value):
+                    for receipt in markers(text):
+                        if receipts.accept(receipt):
+                            respond(receipt)
                 if value.get("type") == "user" and value.get("uuid") in submitted:
                     emit("cli_acknowledged", message_id=submitted[value["uuid"]], uuid=value["uuid"])
                 elif value.get("type") == "system" and value.get("subtype") == "init":
@@ -265,6 +322,7 @@ def run(args: argparse.Namespace, client: BrokerClient | None = None) -> int:
     finally:
         stop.set()
         stop_child(child)
+        fail_pending("Claude adapter stopped before an explicit answer")
         for thread in threads:
             thread.join(timeout=0.1)
 

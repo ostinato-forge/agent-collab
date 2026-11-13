@@ -30,9 +30,9 @@ import stat
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, cast
+from typing import Any, Callable, cast
 from urllib.parse import parse_qs, urlparse
 
 DEFAULT_HOST = "127.0.0.1"
@@ -117,8 +117,27 @@ def load_or_create_token(
     return token
 
 
+RESPONSE_DEFAULTS = {"ack_timeout": 30, "progress_timeout": 120, "max_nudges": 2}
+RESPONSE_STATES = frozenset({"acknowledged", "working", "answered", "failed"})
+RESPONSE_TERMINAL = frozenset({"answered", "failed", "timed_out"})
+MAX_TRACKED_RESPONSES = 4096
+
+
+def response_policy(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) - set(RESPONSE_DEFAULTS):
+        raise ValueError("response must be an object with known policy fields")
+    policy = {**RESPONSE_DEFAULTS, **value}
+    for name, number in policy.items():
+        minimum, maximum = (0, 5) if name == "max_nudges" else (1, 3600)
+        if type(number) is not int or not minimum <= number <= maximum:
+            raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
+    return policy
+
+
 class MessageStore:
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._responses: dict[int, dict[str, Any]] = {}
         self._messages: list[dict[str, Any]] = []
         self._condition = threading.Condition()
         self._started_at = utc_now().isoformat()
@@ -133,10 +152,16 @@ class MessageStore:
         kind: str = "signal",
         channel: str | None = None,
         expected_generation: str | None = None,
+        response: dict[str, int] | None = None,
     ) -> dict[str, Any]:
+        policy = response_policy(response) if response is not None else None
+        if policy is not None and (kind != "chat" or not channel or to == from_actor):
+            raise ValueError("response tracking requires chat, a channel, and distinct roles")
         with self._condition:
             if expected_generation is not None and expected_generation != self._generation:
                 raise ValueError("broker generation changed")
+            if policy is not None and len(self._responses) >= MAX_TRACKED_RESPONSES:
+                raise ValueError("response tracking capacity reached; archive and clear the broker")
             msg = {
                 "id": len(self._messages) + 1,
                 "to": to,
@@ -146,9 +171,121 @@ class MessageStore:
                 "channel": channel,
                 "at": utc_now().isoformat(),
             }
+            if policy is not None:
+                msg["response_required"] = True
+                record = {
+                    "message_id": msg["id"], "generation": self._generation,
+                    "from": from_actor, "to": to, "channel": channel,
+                    "state": "queued", "detail": "", "nudges": 0,
+                    "updated": utc_now().isoformat(), "policy": policy,
+                    "overdue": False,
+                }
+                self._set_response_deadline(record, policy["ack_timeout"])
+                self._responses[msg["id"]] = record
             self._messages.append(msg)
             self._condition.notify_all()
         return dict(msg)
+
+    def _set_response_deadline(self, record: dict[str, Any], seconds: int) -> None:
+        record["_due"] = self._clock() + seconds
+        record["deadline"] = (utc_now() + timedelta(seconds=seconds)).isoformat()
+        record["overdue"] = False
+
+    @staticmethod
+    def _public_response(record: dict[str, Any]) -> dict[str, Any]:
+        return {key: (dict(value) if isinstance(value, dict) else value)
+                for key, value in record.items() if not key.startswith("_")}
+
+    def responses(self, channel: str | None = None) -> dict[str, Any]:
+        with self._condition:
+            return {"generation": self._generation,
+                    "responses": [self._public_response(record)
+                                  for record in self._responses.values()
+                                  if channel is None or record["channel"] == channel]}
+
+    def respond(self, *, generation: str, message_id: int, actor: str,
+                state: str, detail: str = "") -> dict[str, Any]:
+        try:
+            detail_bytes = detail.encode("utf-8") if isinstance(detail, str) else None
+        except UnicodeError as exc:
+            raise TypeError("response detail must be valid UTF-8") from exc
+        if (not isinstance(generation, str) or not generation
+                or type(message_id) is not int or message_id < 1
+                or not isinstance(actor, str) or not valid_role(actor)
+                or not isinstance(state, str) or state not in RESPONSE_STATES
+                or not isinstance(detail, str) or has_control_chars(detail)
+                or detail_bytes is None or len(detail_bytes) > MAX_BODY_BYTES):
+            raise TypeError("invalid response fields")
+        with self._condition:
+            if generation != self._generation:
+                raise ValueError("broker generation changed")
+            record = self._responses.get(message_id)
+            if record is None:
+                raise ValueError("message is not tracked")
+            if actor != record["to"]:
+                raise ValueError("actor is not the message recipient")
+            if record["state"] in RESPONSE_TERMINAL:
+                raise ValueError("response is already terminal")
+            if record["state"] == "working" and state == "acknowledged":
+                raise ValueError("response state cannot move backwards")
+            if record["state"] == state and record["detail"] == detail:
+                return self._public_response(record)
+            # An acknowledgement is one event, not a heartbeat.
+            if record["state"] == "acknowledged" and state == "acknowledged":
+                return self._public_response(record)
+            record["state"] = state
+            record["detail"] = detail
+            record["updated"] = utc_now().isoformat()
+            if state in RESPONSE_TERMINAL:
+                record["deadline"] = None
+                record["overdue"] = False
+                if state == "failed":
+                    self._response_alert(record)
+            else:
+                self._set_response_deadline(record, record["policy"]["progress_timeout"])
+            self._condition.notify_all()
+            return self._public_response(record)
+
+    def _response_alert(self, record: dict[str, Any]) -> None:
+        message = self.send(
+            to=record["from"], from_actor=record["to"], kind="signal",
+            channel=record["channel"],
+            body=f"Response alert: message {record['message_id']} to {record['to']} "
+                 f"is {record['state']}. Inspect the session before retrying.",
+        )
+        # Attach metadata to the stored message while the condition is held.
+        self._messages[message["id"] - 1].update(
+            response_alert_for=record["message_id"], response_state=record["state"])
+
+    def check_deadlines(self) -> None:
+        """Run bounded deadline work without using a model to poll."""
+        with self._condition:
+            now = self._clock()
+            for record in self._responses.values():
+                if record["state"] in RESPONSE_TERMINAL or now < record["_due"]:
+                    continue
+                record["overdue"] = True
+                policy = record["policy"]
+                if record["nudges"] >= policy["max_nudges"]:
+                    record["state"] = "timed_out"
+                    record["updated"] = utc_now().isoformat()
+                    record["deadline"] = None
+                    self._response_alert(record)
+                    continue
+                record["nudges"] += 1
+                interval = policy["ack_timeout"] if record["state"] == "queued" else policy["progress_timeout"]
+                # A nudge changes the retry schedule, not the last response deadline.
+                record["_due"] = now + interval
+                message = self.send(
+                    to=record["to"], from_actor=record["from"], kind="chat",
+                    channel=record["channel"],
+                    body=f"Automated response-monitor nudge for message {record['message_id']}. "
+                         "Acknowledge it or report current progress using its original message ID. "
+                         "This is a monitoring request, not a new instruction from the operator.",
+                )
+                self._messages[message["id"] - 1].update(
+                    nudge_for=record["message_id"], response_required=True)
+            self._condition.notify_all()
 
     def recv(
         self,
@@ -163,6 +300,7 @@ class MessageStore:
     ) -> list[dict[str, Any]]:
         with self._condition:
             return self._filter_locked(
+                oldest=True,
                 role=role,
                 since=since,
                 after_id=after_id,
@@ -188,6 +326,7 @@ class MessageStore:
         with self._condition:
             while True:
                 msgs = self._filter_locked(
+                    oldest=True,
                     role=role,
                     since=since,
                     after_id=after_id,
@@ -216,7 +355,7 @@ class MessageStore:
         with self._condition:
             generation = expected_generation if expected_generation is not None else self._generation
             while True:
-                messages = self._filter_locked(**filters)
+                messages = self._filter_locked(oldest=True, **filters)
                 remaining = deadline - time.monotonic()
                 if messages or remaining <= 0 or generation != self._generation:
                     return {
@@ -269,12 +408,14 @@ class MessageStore:
     def clear(self) -> None:
         with self._condition:
             self._messages.clear()
+            self._responses.clear()
             self._generation = secrets.token_hex(16)
             self._condition.notify_all()
 
     def _filter_locked(
         self,
         *,
+        oldest: bool = False,
         role: str | None = None,
         to_role: str | None = None,
         since: datetime | None = None,
@@ -302,7 +443,7 @@ class MessageStore:
                 continue
             filtered.append(dict(message))
         if limit is not None and limit >= 0:
-            filtered = filtered[-limit:]
+            filtered = filtered[:limit] if oldest else (filtered[-limit:] if limit else [])
         return filtered
 
 
@@ -326,6 +467,9 @@ class BrokerHTTPServer(ThreadingHTTPServer):
         self.require_auth = require_auth
         self.max_body_bytes = max_body_bytes
 
+    def service_actions(self) -> None:
+        self.store.check_deadlines()
+
 
 class BrokerHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
@@ -334,6 +478,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/send":
             self._handle_send()
+        elif parsed.path == "/response":
+            self._handle_response()
         elif parsed.path == "/clear":
             self._store.clear()
             self._json_response({"cleared": True})
@@ -348,6 +494,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._handle_recv(parsed)
         elif parsed.path == "/history":
             self._handle_history(parsed)
+        elif parsed.path == "/responses":
+            channel = parse_qs(parsed.query).get("channel", [None])[0]
+            if channel is not None and not valid_channel(channel):
+                self._json_response({"error": "invalid channel"}, status=400)
+                return
+            self._json_response(self._store.responses(channel))
         elif parsed.path == "/status":
             self._json_response(self._store.status())
         else:
@@ -388,7 +540,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 status=400,
             )
             return
-        if len(text.encode("utf-8")) > self._server.max_body_bytes:
+        try:
+            text_bytes = text.encode("utf-8")
+        except UnicodeError:
+            self._json_response({"error": "body must be valid UTF-8"}, status=400)
+            return
+        if len(text_bytes) > self._server.max_body_bytes:
             self._json_response(
                 {"error": f"body exceeds {self._server.max_body_bytes} bytes"},
                 status=413,
@@ -404,6 +561,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._json_response({"error": "chat messages require a channel"}, status=400)
             return
 
+        policy = None
+        if "response" in body:
+            try:
+                policy = response_policy(body["response"])
+                if kind != "chat" or not channel or to == from_actor:
+                    raise ValueError("response tracking requires chat, a channel, and distinct roles")
+            except ValueError as exc:
+                self._json_response({"error": str(exc)}, status=400)
+                return
         generation = body.get("generation")
         if generation is not None and not isinstance(generation, str):
             self._json_response({"error": "generation must be a string"}, status=400)
@@ -416,11 +582,30 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 kind=kind,
                 channel=channel,
                 expected_generation=generation,
+                response=policy,
             )
-        except ValueError:
-            self._json_response({"error": "broker generation changed"}, status=409)
+        except ValueError as exc:
+            self._json_response({"error": str(exc)}, status=409)
             return
         self._json_response(message, status=201)
+
+    def _handle_response(self) -> None:
+        body = self._read_json()
+        if body is None:
+            return
+        required = {"generation", "message_id", "actor", "state"}
+        if not required <= set(body) or set(body) - (required | {"detail"}):
+            self._json_response({"error": "invalid response fields"}, status=400)
+            return
+        try:
+            response = self._store.respond(**body)
+        except TypeError as exc:
+            self._json_response({"error": str(exc)}, status=400)
+            return
+        except ValueError as exc:
+            self._json_response({"error": str(exc)}, status=409)
+            return
+        self._json_response(response)
 
     def _handle_recv(self, parsed: Any) -> None:
         filters = self._parse_filters(parsed, require_role=True)

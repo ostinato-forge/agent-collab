@@ -68,6 +68,8 @@ thread. The adapters use blocking long polling, stream messages into Claude,
 and queue Claude replies for Codex without starting a second coordinator.
 See [Live agent chat](docs/live-agent-chat.md) for setup, delivery states,
 permissions, and recovery. No A2A server or new Python dependency is needed.
+Use [response monitoring](docs/response-monitoring.md) when a message needs an
+explicit acknowledgement, progress updates, and bounded nudges.
 
 ## Commit Identity Hygiene
 

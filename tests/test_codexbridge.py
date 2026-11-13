@@ -51,7 +51,7 @@ def test_skips_history_scopes_long_poll_and_reports_only_queue(tmp_path):
     assert count == 1 and delivered[0][2] == message()
     query = parse_qs(urlsplit(client.calls[1][0]).query)
     assert query == {"role": ["architect"], "from": ["builder"], "channel": ["test:chat"],
-                     "kind": ["chat"], "after_id": ["3"], "wait": ["30"], "generation": ["g"]}
+                     "after_id": ["3"], "wait": ["30"], "generation": ["g"]}
     assert events[1] == {"state": "queued_to_codex", "message_id": 4}
     assert "read" not in json.dumps(events) and "answered" not in json.dumps(events)
 
@@ -98,7 +98,7 @@ def test_generation_change_clear_or_old_broker_refused(tmp_path, snapshot):
 
 @pytest.mark.parametrize("change", [{"id": 3}, {"id": True}, {"id": 5}, {"body": "x\ny"},
                                     {"body": "x" * 4097}, {"to": "other"}, {"from": "other"},
-                                    {"channel": "other"}, {"kind": "signal"}])
+                                    {"channel": "other"}, {"kind": "unknown"}])
 def test_malformed_or_wrong_scope_message_never_delivered(tmp_path, change):
     client = FakeClient([{"generation": "g", "total": 3},
                          {"generation": "g", "total": 4, "messages": [message(**change)]}])
@@ -241,3 +241,64 @@ def test_fifo_token_is_rejected_without_waiting_for_writer(tmp_path):
         "--token-file", str(token),
     ], timeout=3, capture_output=True, text=True)
     assert result.returncode == 1 and "regular file" in result.stderr
+
+
+def test_signal_progress_is_skipped_but_timeout_alert_and_chat_are_delivered(tmp_path):
+    client = FakeClient([{'generation': 'g', 'total': 3},
+        {'generation': 'g', 'total': 6, 'messages': [message(4, kind='signal'),
+         message(5, kind='signal', response_alert_for=1, response_state='timed_out'), message(6)]}])
+    delivered, events = [], []
+    assert bridge.run_bridge(args(tmp_path, max_messages=2), client,
+        deliver=lambda *values: delivered.append(values), report=events.append) == 2
+    assert [values[2]['id'] for values in delivered] == [5, 6]
+    assert any(event['state'] == 'response_alert' for event in events)
+
+
+def test_nudge_resume_only_when_opted_in_and_only_for_nudges(tmp_path, monkeypatch):
+    commands, reports = [], []
+    def run(command, **kwargs):
+        commands.append(command)
+        kwargs['stderr'].write(b'warning: could not resume\n')
+        return subprocess.CompletedProcess(command, 0)
+    monkeypatch.setattr(bridge.subprocess, 'run', run)
+    for enabled, nudge in [(False, True), (True, False), (True, True)]:
+        tracked = dict(message(), response_required=True)
+        if nudge:
+            tracked['nudge_for'] = 1
+        client = FakeClient([{'generation': 'g', 'total': 3},
+                            {'generation': 'g', 'total': 4, 'messages': [tracked]}])
+        bridge.run_bridge(args(tmp_path, nudge_resume=enabled), client,
+                          deliver=bridge.queue_message, report=reports.append)
+    assert ['--resume' in command for command in commands] == [False, False, True]
+    wake = [event for event in reports if event['state'] == 'wake_requested']
+    assert len(wake) == 1 and wake[0]['warning_present'] is True
+    assert 'not confirmed' in wake[0]['meaning']
+    assert 'respond --message-id 1 --generation g --actor architect --state acknowledged' in commands[-1][5]
+
+
+def test_tracked_enqueue_failure_is_reported_without_ack(tmp_path):
+    class Client(FakeClient):
+        def __init__(self, replies):
+            super().__init__(replies)
+            self.receipts = []
+        def post(self, path, data, *, timeout):
+            self.receipts.append((path, data))
+    client = Client([{'generation': 'g', 'total': 3},
+        {'generation': 'g', 'total': 4, 'messages': [dict(message(), response_required=True)]}])
+    def fail(*args):
+        raise bridge.BridgeError('failed')
+    with pytest.raises(bridge.BridgeError):
+        bridge.run_bridge(args(tmp_path), client, deliver=fail, report=lambda event: None)
+    assert len(client.receipts) == 1
+    assert client.receipts[0][1]['state'] == 'failed'
+    assert client.receipts[0][1]['message_id'] == 4
+
+
+def test_successful_tracked_queue_does_not_claim_acknowledgement(tmp_path):
+    client = FakeClient([{'generation': 'g', 'total': 3},
+        {'generation': 'g', 'total': 4, 'messages': [dict(message(), response_required=True)]}])
+    delivered = []
+    bridge.run_bridge(args(tmp_path), client, deliver=lambda *values: delivered.append(values),
+                      report=lambda event: None)
+    assert '--state acknowledged' in delivered[0][2]['_response_command']
+    assert not hasattr(client, 'post')

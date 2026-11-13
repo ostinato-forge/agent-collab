@@ -189,7 +189,10 @@ def test_sigterm_runs_owned_child_cleanup(tmp_path):
     child_pid = tmp_path / "child.pid"
     child_script = tmp_path / "child.py"
     child_script.write_text("import os,time\nfrom pathlib import Path\n"
-                            f"Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+                            f"p = Path({str(child_pid)!r})\n"
+                            "tmp = p.with_suffix('.tmp')\n"
+                            "tmp.write_text(str(os.getpid()))\n"
+                            "tmp.replace(p)\n"
                             "time.sleep(30)\n")
     runner = tmp_path / "adapter.py"
     runner.write_text(f'''import sys, time
@@ -258,3 +261,109 @@ def test_token_fifo_is_rejected_without_blocking(tmp_path):
     os.mkfifo(path, 0o600)
     with pytest.raises(RuntimeError, match='regular file'):
         agentchat.read_token(path)
+
+
+class ResponseBroker(FakeBroker):
+    def __init__(self, messages=()):
+        super().__init__(messages)
+        self.responses = []
+
+    def call(self, path, data=None):
+        if path == '/response':
+            self.responses.append(data)
+            return data
+        return super().call(path, data)
+
+
+def test_explicit_model_receipts_are_deduplicated_and_echo_is_not_ack(tmp_path, monkeypatch):
+    fake_process(tmp_path, monkeypatch, '''
+msg = json.loads(sys.stdin.readline())
+print(json.dumps(msg), flush=True)
+text = 'COLLAB_RESPONSE {"message_id":6,"state":"acknowledged","detail":"received"}\\nCOLLAB_RESPONSE {"message_id":6,"state":"answered","detail":"done"}'
+print(json.dumps({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":text}]}}), flush=True)
+print(json.dumps({"type":"result","result":text}), flush=True)
+time.sleep(30)
+''')
+    client = ResponseBroker([dict(message(6), response_required=True)])
+    assert agentchat.run(args(tmp_path, turns=1), client) == 0
+    assert [item['state'] for item in client.responses] == ['acknowledged', 'answered']
+    assert all(item['generation'] == 'one' and item['actor'] == 'builder' for item in client.responses)
+
+
+def test_unrelated_completion_and_echo_leave_request_failed_at_stop(tmp_path, monkeypatch):
+    fake_process(tmp_path, monkeypatch, '''
+msg = json.loads(sys.stdin.readline())
+print(json.dumps(msg), flush=True)
+print(json.dumps({"type":"result","result":"unrelated output"}), flush=True)
+time.sleep(30)
+''')
+    client = ResponseBroker([dict(message(6), response_required=True)])
+    assert agentchat.run(args(tmp_path, turns=1), client) == 0
+    assert [item['state'] for item in client.responses] == ['failed']
+
+
+def test_child_failure_marks_known_request_failed(tmp_path, monkeypatch):
+    fake_process(tmp_path, monkeypatch, 'sys.stdin.readline()\nsys.exit(7)\n')
+    client = ResponseBroker([dict(message(6), response_required=True)])
+    with pytest.raises(RuntimeError):
+        agentchat.run(args(tmp_path, turns=1), client)
+    assert [item['state'] for item in client.responses] == ['failed']
+
+
+def test_late_receipt_does_not_stop_other_request(tmp_path, monkeypatch, capsys):
+    from urllib.error import HTTPError
+    fake_process(tmp_path, monkeypatch, '''
+sys.stdin.readline()
+sys.stdin.readline()
+text = 'COLLAB_RESPONSE {"message_id":6,"state":"acknowledged"}\\nCOLLAB_RESPONSE {"message_id":7,"state":"answered","detail":"done"}'
+print(json.dumps({"type":"result","result":text}), flush=True)
+print(json.dumps({"type":"result","result":"second"}), flush=True)
+time.sleep(30)
+''')
+    class Late(ResponseBroker):
+        def call(self, path, data=None):
+            if path == '/response' and data['message_id'] == 6:
+                raise HTTPError('http://localhost/response', 409, 'terminal', {}, None)
+            if path.startswith('/responses?'):
+                return {'generation': 'one', 'responses': [{'message_id': 6, 'state': 'timed_out'}]}
+            return super().call(path, data)
+    client = Late([dict(message(6), response_required=True), dict(message(7), response_required=True)])
+    assert agentchat.run(args(tmp_path, turns=2), client) == 0
+    assert [item['state'] for item in client.responses] == ['answered']
+    assert 'response_rejected' in capsys.readouterr().out
+
+
+def test_answered_request_is_not_failed_when_other_request_loses_child(tmp_path, monkeypatch):
+    fake_process(tmp_path, monkeypatch, '''
+sys.stdin.readline()
+sys.stdin.readline()
+text = 'COLLAB_RESPONSE {"message_id":6,"state":"answered","detail":"done"}'
+print(json.dumps({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":text}]}}), flush=True)
+sys.exit(7)
+''')
+    client = ResponseBroker([dict(message(6), response_required=True), dict(message(7), response_required=True)])
+    with pytest.raises(RuntimeError):
+        agentchat.run(args(tmp_path), client)
+    assert [(item['message_id'], item['state']) for item in client.responses] == [(6, 'answered'), (7, 'failed')]
+
+
+def test_nudge_for_known_answered_request_does_not_start_extra_model_input(tmp_path, monkeypatch, capsys):
+    fake_process(tmp_path, monkeypatch, '''
+sys.stdin.readline()
+text = 'COLLAB_RESPONSE {"message_id":6,"state":"answered","detail":"done"}'
+print(json.dumps({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":text}]}}), flush=True)
+sys.stdin.readline()
+from pathlib import Path
+Path('extra-input').touch()
+time.sleep(30)
+''')
+    class Nudged(ResponseBroker):
+        def call(self, path, data=None):
+            result = super().call(path, data)
+            if path == '/response' and data['state'] == 'answered':
+                self.messages.append(dict(message(7), response_required=True, nudge_for=6))
+            return result
+    client = Nudged([dict(message(6), response_required=True)])
+    assert agentchat.run(args(tmp_path, timeout=1), client) == 124
+    assert not (tmp_path / 'extra-input').exists()
+    assert 'nudge_skipped' in capsys.readouterr().out
