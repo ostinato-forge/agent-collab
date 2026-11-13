@@ -367,3 +367,62 @@ time.sleep(30)
     assert agentchat.run(args(tmp_path, timeout=1), client) == 124
     assert not (tmp_path / 'extra-input').exists()
     assert 'nudge_skipped' in capsys.readouterr().out
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_cleanup_reaps_exited_leader_after_group_permission_error(monkeypatch):
+    from types import SimpleNamespace
+    events = []
+    reaped = False
+
+    def poll():
+        nonlocal reaped
+        events.append('reaped')
+        reaped = True
+        return 7
+
+    def killpg(pid, sig):
+        events.append('signal')
+        if not reaped:
+            raise PermissionError('unreaped group')
+        raise ProcessLookupError('group is gone')
+
+    child = SimpleNamespace(pid=123, poll=poll, wait=lambda **kwargs: 7,
+                            stdin=None, stdout=None, stderr=None)
+    monkeypatch.setattr(agentchat.os, 'killpg', killpg)
+    agentchat.stop_child(child)
+    assert events[:3] == ['signal', 'reaped', 'signal']
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.parametrize('returncode', [None, 7])
+def test_cleanup_keeps_real_group_permission_errors(monkeypatch, returncode):
+    from types import SimpleNamespace
+
+    def denied(*args):
+        raise PermissionError('permission denied')
+
+    child = SimpleNamespace(pid=123, poll=lambda: returncode)
+    monkeypatch.setattr(agentchat.os, 'killpg', denied)
+    with pytest.raises(PermissionError, match='permission denied'):
+        agentchat.stop_child(child)
+
+
+def test_cleanup_error_still_reports_pending_request(tmp_path, monkeypatch):
+    fake_process(tmp_path, monkeypatch, '''
+json.loads(sys.stdin.readline())
+print(json.dumps({"type":"result","result":"unrelated output"}), flush=True)
+time.sleep(30)
+''')
+    cleanup = agentchat.stop_child
+
+    def cleanup_then_error(child):
+        cleanup(child)
+        raise PermissionError('cleanup failed')
+
+    monkeypatch.setattr(agentchat, 'stop_child', cleanup_then_error)
+    client = ResponseBroker([dict(message(6), response_required=True)])
+    with pytest.raises(PermissionError, match='cleanup failed'):
+        agentchat.run(args(tmp_path, turns=1), client)
+    assert client.responses[-1]['message_id'] == 6
+    assert client.responses[-1]['state'] == 'failed'

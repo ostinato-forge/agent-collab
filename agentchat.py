@@ -117,6 +117,15 @@ def stop_child(child: subprocess.Popen[bytes]) -> None:
             os.killpg(child.pid, sig)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            # Reap an exited leader before retrying its group. Keep real
+            # permission failures visible, including a failed second attempt.
+            if child.poll() is None:
+                raise
+            try:
+                os.killpg(child.pid, sig)
+            except ProcessLookupError:
+                pass
 
     # A dead leader can leave children holding our pipes. Stop the owned group
     # even when poll() says the direct process has already exited.
@@ -321,10 +330,12 @@ def run(args: argparse.Namespace, client: BrokerClient | None = None) -> int:
         return 124
     finally:
         stop.set()
-        stop_child(child)
-        fail_pending("Claude adapter stopped before an explicit answer")
-        for thread in threads:
-            thread.join(timeout=0.1)
+        try:
+            stop_child(child)
+        finally:
+            fail_pending("Claude adapter stopped before an explicit answer")
+            for thread in threads:
+                thread.join(timeout=0.1)
 
 
 def build_parser() -> argparse.ArgumentParser:

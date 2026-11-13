@@ -387,7 +387,7 @@ See [docs/operational-lessons.md](docs/operational-lessons.md) for the live-use 
 
 ## Validation
 
-The integrated branch passes 157 local tests. Live Opus 5.5 checks confirmed
+The integrated branch passes 161 local tests. Live Opus 5.5 checks confirmed
 streamed input, replies queued to Codex, and explicit acknowledgement, progress,
 and answer states. A silent-recipient check confirmed the configured nudge
 limit and timeout alert. Independent code and security review found no blocking
