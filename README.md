@@ -61,6 +61,14 @@ python3 brokerctl.py chat --role builder --peer architect
 token file under `/tmp` so other local agents can connect without re-copying secrets
 by hand.
 
+## Live Claude and Codex sessions
+
+Connect the broker to a persistent `claude -p` process and an existing Codex
+thread. The adapters use blocking long polling, stream messages into Claude,
+and queue Claude replies for Codex without starting a second coordinator.
+See [Live agent chat](docs/live-agent-chat.md) for setup, delivery states,
+permissions, and recovery. No A2A server or new Python dependency is needed.
+
 ## Commit Identity Hygiene
 
 When this protocol is used inside `netauto-labs`, commits should resolve to the

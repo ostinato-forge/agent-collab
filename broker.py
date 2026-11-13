@@ -122,6 +122,7 @@ class MessageStore:
         self._messages: list[dict[str, Any]] = []
         self._condition = threading.Condition()
         self._started_at = utc_now().isoformat()
+        self._generation = secrets.token_hex(16)
 
     def send(
         self,
@@ -131,8 +132,11 @@ class MessageStore:
         body: str,
         kind: str = "signal",
         channel: str | None = None,
+        expected_generation: str | None = None,
     ) -> dict[str, Any]:
         with self._condition:
+            if expected_generation is not None and expected_generation != self._generation:
+                raise ValueError("broker generation changed")
             msg = {
                 "id": len(self._messages) + 1,
                 "to": to,
@@ -199,6 +203,30 @@ class MessageStore:
                     return []
                 self._condition.wait(timeout=remaining)
 
+    def receive_snapshot(
+        self, *, timeout: float = 0, expected_generation: str | None = None,
+        **filters: Any,
+    ) -> dict[str, Any]:
+        """Read messages and their queue generation under the same lock.
+
+        A clear wakes pending readers even if no new message has arrived.
+        Adapters must stop when the generation differs from their initial one.
+        """
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            generation = expected_generation if expected_generation is not None else self._generation
+            while True:
+                messages = self._filter_locked(**filters)
+                remaining = deadline - time.monotonic()
+                if messages or remaining <= 0 or generation != self._generation:
+                    return {
+                        "messages": messages,
+                        "count": len(messages),
+                        "total": len(self._messages),
+                        "generation": self._generation,
+                    }
+                self._condition.wait(timeout=remaining)
+
     def history(
         self,
         *,
@@ -235,11 +263,13 @@ class MessageStore:
                 "by_role": roles,
                 "by_kind": kinds,
                 "started_at": self._started_at,
+                "generation": self._generation,
             }
 
     def clear(self) -> None:
         with self._condition:
             self._messages.clear()
+            self._generation = secrets.token_hex(16)
             self._condition.notify_all()
 
     def _filter_locked(
@@ -374,13 +404,22 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._json_response({"error": "chat messages require a channel"}, status=400)
             return
 
-        message = self._store.send(
-            to=to,
-            from_actor=from_actor,
-            body=text,
-            kind=kind,
-            channel=channel,
-        )
+        generation = body.get("generation")
+        if generation is not None and not isinstance(generation, str):
+            self._json_response({"error": "generation must be a string"}, status=400)
+            return
+        try:
+            message = self._store.send(
+                to=to,
+                from_actor=from_actor,
+                body=text,
+                kind=kind,
+                channel=channel,
+                expected_generation=generation,
+            )
+        except ValueError:
+            self._json_response({"error": "broker generation changed"}, status=409)
+            return
         self._json_response(message, status=201)
 
     def _handle_recv(self, parsed: Any) -> None:
@@ -389,11 +428,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         filters.pop("to_role")
         wait = min(filters.pop("wait"), MAX_WAIT_SECONDS)
-        if wait > 0:
-            messages = self._store.wait_for_message(timeout=wait, **filters)
-        else:
-            messages = self._store.recv(**filters)
-        self._json_response({"messages": messages, "count": len(messages)})
+        expected_generation = parse_qs(parsed.query).get("generation", [None])[0]
+        self._json_response(self._store.receive_snapshot(
+            timeout=wait, expected_generation=expected_generation, **filters,
+        ))
 
     def _handle_history(self, parsed: Any) -> None:
         filters = self._parse_filters(parsed, require_role=False)

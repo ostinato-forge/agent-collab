@@ -213,3 +213,86 @@ def test_send_rejects_control_characters_in_body() -> None:
         _stop_server(server, thread)
 
     assert excinfo.value.code == 400
+
+
+def test_generation_changes_on_clear_and_restart() -> None:
+    store = broker.MessageStore()
+    initial = store.status()['generation']
+    store.send(to='builder', from_actor='architect', body='first')
+    snapshot = store.receive_snapshot(role='builder')
+    assert snapshot['generation'] == initial
+    assert snapshot['total'] == snapshot['count'] == 1
+    store.clear()
+    store.send(to='builder', from_actor='architect', body='replacement')
+    replacement = store.receive_snapshot(role='builder')
+    assert replacement['generation'] != initial
+    assert replacement['messages'][0]['id'] == 1
+    assert broker.MessageStore().status()['generation'] != replacement['generation']
+
+
+def test_clear_wakes_snapshot_reader() -> None:
+    store = broker.MessageStore()
+    initial = store.status()['generation']
+    started = threading.Event()
+    original_filter = store._filter_locked
+
+    def observed_filter(**kwargs):
+        started.set()
+        return original_filter(**kwargs)
+
+    store._filter_locked = observed_filter
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(store.receive_snapshot, role='builder', timeout=30)
+        assert started.wait(2)
+        store.clear()
+        snapshot = pending.result(timeout=2)
+    assert snapshot['generation'] != initial
+    assert snapshot['messages'] == []
+
+
+def test_http_receive_includes_atomic_generation() -> None:
+    server, thread, url = _start_server()
+    try:
+        initial = _request_json(url + '/status')['generation']
+        snapshot = _request_json(url + '/recv?role=builder')
+        assert snapshot == {'generation': initial, 'total': 0, 'count': 0, 'messages': []}
+        _request_json(url + '/clear', method='POST', payload={})
+        assert _request_json(url + '/recv?role=builder')['generation'] != initial
+    finally:
+        _stop_server(server, thread)
+
+
+def test_send_rejects_reply_from_previous_generation() -> None:
+    server, thread, url = _start_server()
+    try:
+        generation = _request_json(url + '/status')['generation']
+        _request_json(url + '/clear', method='POST', payload={})
+        with pytest.raises(HTTPError) as exc:
+            _request_json(url + '/send', method='POST', payload={
+                'to': 'architect', 'from': 'builder', 'body': 'old result',
+                'generation': generation,
+            })
+        assert exc.value.code == 409
+        assert _request_json(url + '/status')['total'] == 0
+        current = _request_json(url + '/status')['generation']
+        sent = _request_json(url + '/send', method='POST', payload={
+            'to': 'architect', 'from': 'builder', 'body': 'current result',
+            'generation': current,
+        })
+        assert sent['id'] == 1
+    finally:
+        _stop_server(server, thread)
+
+
+def test_receive_with_old_generation_does_not_wait() -> None:
+    server, thread, url = _start_server()
+    try:
+        generation = _request_json(url + '/status')['generation']
+        _request_json(url + '/clear', method='POST', payload={})
+        result = _request_json(url + '/recv?' + urlencode({
+            'role': 'builder', 'generation': generation, 'wait': 30,
+        }), timeout=2)
+        assert result['generation'] != generation
+        assert result['messages'] == []
+    finally:
+        _stop_server(server, thread)
